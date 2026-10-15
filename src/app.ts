@@ -3,10 +3,12 @@ import cors from 'cors';
 import routes from './routes/v1/index.js';
 import { errorConverter, errorHandler } from './middlewares/error.js';
 import { ApiError } from './utils/ApiError.js';
+import { captureRawBody } from './middlewares/whatsappSignature.js';
 
 const app = express();
 
-app.use(express.json());
+// `verify` keeps the raw bytes for the WhatsApp webhook's HMAC signature check.
+app.use(express.json({ verify: captureRawBody }));
 
 // origin:true reflects the request's actual Origin header back (instead of
 // the previous bare wildcard '*') and credentials:true sends

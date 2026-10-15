@@ -49,6 +49,14 @@ export async function receiveWebhookMessage(req: Request, res: Response): Promis
     const msg = change?.value?.messages?.[0];
     if (!msg) return;
 
+    // Meta can deliver the same message more than once (retries on a slow
+    // ack, occasional duplicates) — running the state machine twice would
+    // double-advance flows and send duplicate replies.
+    if (!(await sessionService.claimInboundMessage(msg.id))) {
+      logger.info(`[${msg.from}] Duplicate webhook delivery for message ${msg.id} — ignored`);
+      return;
+    }
+
     await sendTypingIndicator(msg.id);
 
     const phone = msg.from;

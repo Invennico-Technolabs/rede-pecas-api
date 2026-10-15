@@ -22,6 +22,14 @@ for (const envVar of requiredEnvVars) {
   }
 }
 
+// The webhook signature check is mandatory in production. Locally it's
+// optional so a dev can drive the webhook with curl/Postman without signing
+// payloads — whatsappSignature.ts skips verification when this is unset
+// (index.ts logs a boot warning in that case).
+if (!process.env.WHATSAPP_APP_SECRET && process.env.NODE_ENV === 'production') {
+  throw new Error('Config validation error: environment variable WHATSAPP_APP_SECRET is missing.');
+}
+
 export const config = {
   env: process.env.NODE_ENV || 'development',
   port: parseInt(process.env.PORT || '4000', 10),
@@ -42,6 +50,7 @@ export const config = {
     token: process.env.WHATSAPP_TOKEN,
     phoneNumberId: process.env.WHATSAPP_PHONE_NUMBER_ID,
     verifyToken: process.env.WHATSAPP_VERIFY_TOKEN,
+    appSecret: process.env.WHATSAPP_APP_SECRET,
     graphApiUrl: process.env.WHATSAPP_GRAPH_API_URL || 'https://graph.facebook.com/v19.0'
   },
   jwt: {
