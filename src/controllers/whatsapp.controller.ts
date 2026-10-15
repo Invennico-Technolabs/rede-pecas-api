@@ -13,6 +13,7 @@ import { sendWhatsAppButtons, sendTypingIndicator, sendWhatsAppMessage } from '.
 import { getAdminByPhone, getAllAdmins } from '../models/adminUser.model.js';
 import { config } from '../config/config.js';
 import { GREETING_PATTERN, detectMessageLocale } from '../utils/greeting.js';
+import { runSerialized } from '../utils/keyedQueue.js';
 
 const HUMAN_HANDOFF_PATTERN = /\b(atendente|humano|falar com (algu[eé]m|pessoa)|operador|suporte humano|human|agent|representative)\b/i;
 
@@ -49,6 +50,14 @@ export async function receiveWebhookMessage(req: Request, res: Response): Promis
     const msg = change?.value?.messages?.[0];
     if (!msg) return;
 
+    // Meta can deliver the same message more than once (retries on a slow
+    // ack, occasional duplicates) — running the state machine twice would
+    // double-advance flows and send duplicate replies.
+    if (!(await sessionService.claimInboundMessage(msg.id))) {
+      logger.info(`[${msg.from}] Duplicate webhook delivery for message ${msg.id} — ignored`);
+      return;
+    }
+
     await sendTypingIndicator(msg.id);
 
     const phone = msg.from;
@@ -65,7 +74,11 @@ export async function receiveWebhookMessage(req: Request, res: Response): Promis
 
     logger.info(`[${phone}] Webhook type: ${mediaType}, text: ${customerText}`);
 
-    await processMessageFlow(phone, customerText, mediaType, mediaId, listReplyId, buttonReplyId, contextMessageId);
+    // One customer's messages are processed strictly in arrival order —
+    // concurrent runs would race on the same session/order state.
+    await runSerialized(phone, () =>
+      processMessageFlow(phone, customerText, mediaType, mediaId, listReplyId, buttonReplyId, contextMessageId)
+    );
   } catch (error: any) {
     logger.error('Error in WhatsApp webhook processing', error);
   }
@@ -125,10 +138,12 @@ async function processMessageFlow(
 
   if (customer.active === false) {
     await sendReply(phone, messages.common.accountInactive());
-    const admins = await getAllAdmins();
-    const custName = customer.name || 'Cliente';
-    for (const admin of admins) {
-      await sendWhatsAppMessage(admin.phone, messages.admin.inactiveCustomerAttempt(custName, phone));
+    if (await sessionService.claimInactiveCustomerAlert(phone)) {
+      const admins = await getAllAdmins();
+      const custName = customer.name || 'Cliente';
+      for (const admin of admins) {
+        await sendWhatsAppMessage(admin.phone, messages.admin.inactiveCustomerAttempt(custName, phone));
+      }
     }
     return;
   }

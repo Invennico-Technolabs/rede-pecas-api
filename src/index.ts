@@ -14,6 +14,9 @@ await redisReady;
 
 const server = app.listen(config.port, () => {
   logger.info(`Rede Peças central backend listening on port ${config.port} in ${config.env} mode`);
+  if (!config.whatsapp.appSecret) {
+    logger.warn('WHATSAPP_APP_SECRET is not set — WhatsApp webhook signatures will NOT be verified.');
+  }
 });
 
 const courtesySweepInterval = setInterval(() => {

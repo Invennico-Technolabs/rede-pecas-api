@@ -14,7 +14,7 @@ const router = express.Router();
 
 router.get('/customers', authMiddleware, validate(adminValidation.customerListQuery), getCustomersHandler);
 router.get('/customers/:phone', authMiddleware, validate(adminValidation.customerPhoneParams), getCustomerHandler);
-router.patch('/customers/:phone/status', authMiddleware, toggleCustomerStatusHandler);
+router.patch('/customers/:phone/status', authMiddleware, validate(adminValidation.customerStatus), toggleCustomerStatusHandler);
 router.patch('/customers/:phone', authMiddleware, validate(adminValidation.customerUpdate), updateCustomerHandler);
 router.delete('/customers/:phone', authMiddleware, validate(adminValidation.customerPhoneParams), deleteCustomerHandler);
 
