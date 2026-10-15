@@ -609,6 +609,19 @@ const INBOUND_MESSAGE_DEDUPE_TTL = 60 * 60 * 24;
 export const claimInboundMessage = (messageId: string): Promise<boolean> =>
   claimKey(`inboundMsg:${messageId}`, INBOUND_MESSAGE_DEDUPE_TTL);
 
+// --- Admin alert throttling -------------------------------------------------
+
+// A deactivated customer often keeps messaging; without a throttle every
+// single message pushed a WhatsApp alert to every admin.
+const INACTIVE_CUSTOMER_ALERT_TTL = 60 * 60 * 6;
+
+/**
+ * Returns true at most once per INACTIVE_CUSTOMER_ALERT_TTL window per
+ * phone — gates the "inactive customer tried to message" admin push.
+ */
+export const claimInactiveCustomerAlert = (phone: string): Promise<boolean> =>
+  claimKey(`inactiveAlert:${phone}`, INACTIVE_CUSTOMER_ALERT_TTL);
+
 // --- Chat transcript --------------------------------------------------------
 
 export interface ChatLogEntry {

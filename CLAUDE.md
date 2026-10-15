@@ -52,7 +52,7 @@ There is still no email notification — none exists in this codebase and none w
 
 ### The message pipeline (the heart of the system)
 
-`processMessageFlow` in `src/controllers/whatsapp.controller.ts` routes every incoming message through a strict priority chain — earlier stages short-circuit later ones.
+`processMessageFlow` in `src/controllers/whatsapp.controller.ts` routes every incoming message through a strict priority chain — earlier stages short-circuit later ones. Messages from the same phone are processed one at a time in arrival order (`runSerialized` in `src/utils/keyedQueue.ts`, in-process — moving to multiple API instances would need a shared Redis/BullMQ lock instead).
 
 Customer profile registration and vehicle identification are **independent state machines**, each with its own status, so whichever is missing is what the bot asks for next — a returning customer whose vehicle session simply expired is sent back into the vehicle-ID flow without re-doing their profile:
 - **Profile**: `customers.registration_status` — `awaiting_name → awaiting_nif → awaiting_nif_number → awaiting_address → complete`. Covers name/NIF/address only.
@@ -64,7 +64,7 @@ Pipeline order (as of 2026-10-15 — re-check against `processMessageFlow` if th
 
 0. **Admin short-circuit** — sender phone matches an `admin_users` row: only button replies are handled (payment approve/reject → `processAdminPaymentReply`, `admin_item_*` → `processAdminItemStockReply`, everything else → `processAdminStockReply`); plain admin text is ignored. Nothing below runs for admins.
 1. Locale detection (`detectMessageLocale` → `saveLocale`), last-message cache for the humanize layer, and the chat transcript (`appendChatMessage`).
-2. Customer lookup/create. A deactivated customer (`customers.active = false`) gets `common.accountInactive()` and every admin is pushed `admin.inactiveCustomerAttempt` — on every message, unthrottled.
+2. Customer lookup/create. A deactivated customer (`customers.active = false`) gets `common.accountInactive()` and every admin is pushed `admin.inactiveCustomerAttempt` — at most once per customer per 6h (`sessionService.claimInactiveCustomerAlert`).
 3. **Fresh session** (no `active:<phone>` key in the last 4h): profile+vehicle complete → `welcomeBack` and (for text) the ask-part prompt; vehicle missing → resume vehicle-ID buttons; profile incomplete → `sendResumeRegistrationPrompt`.
 4. Stale interactive reply — a button/list tap whose `context.id` isn't the latest prompt we sent (`getActivePromptId`) → `common.alreadyAnswered()`.
 5. `order_status_<number>` button → `orderStatusService.processOrderStatusButton`.
