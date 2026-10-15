@@ -83,7 +83,6 @@ Business Settings → Accounts → WhatsApp accounts shows three entries, the ap
 
 **Never** use the "Generate token" button in Step 1 for anything but a quick 24h test.
 
-**Security to-do:** an old commented-out token from a previous dev account was in `.env` and got exposed in a chat log — revoke it in that Meta app if still valid, and delete the line.
 
 ---
 
