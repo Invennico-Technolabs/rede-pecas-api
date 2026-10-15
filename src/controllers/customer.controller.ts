@@ -97,7 +97,7 @@ export const updateCustomerHandler = catchAsync(async (req: Request, res: Respon
 export const toggleCustomerStatusHandler = catchAsync(async (req: Request, res: Response) => {
   const { phone } = req.params;
   const { active } = req.body;
-  const updated = await setCustomerActiveStatus(phone, active !== undefined ? !!active : false);
+  const updated = await setCustomerActiveStatus(phone, active);
   if (!updated) throw new ApiError(404, `Customer ${phone} not found`);
 
   res.status(200).json({

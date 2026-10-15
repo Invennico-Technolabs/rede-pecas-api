@@ -66,6 +66,15 @@ export const customerPhoneParams: ValidationSchema = {
   }),
 };
 
+export const customerStatus: ValidationSchema = {
+  params: Joi.object().keys({
+    phone: Joi.string().required(),
+  }),
+  body: Joi.object().keys({
+    active: Joi.boolean().required(),
+  }),
+};
+
 export const customerUpdate: ValidationSchema = {
   params: Joi.object().keys({
     phone: Joi.string().required(),
