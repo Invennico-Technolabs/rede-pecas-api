@@ -16,6 +16,25 @@ function clampBody(body: string, context: string): string {
   return body.slice(0, INTERACTIVE_BODY_LIMIT - 1) + '…';
 }
 
+// Meta rejects the whole message (error 131009) when any interactive label
+// is over these limits, so the customer gets no reply at all.
+const BUTTON_TITLE_LIMIT = 20;
+const LIST_BUTTON_LIMIT = 20;
+const LIST_ROW_TITLE_LIMIT = 24;
+const LIST_ROW_DESCRIPTION_LIMIT = 72;
+
+/**
+ * Truncates a button/list label to WhatsApp's limit as a last-resort safety
+ * net, logging a warning so the offending catalog string gets shortened at
+ * the source. Counts code points so an emoji is never split in half.
+ */
+function clampLabel(label: string, limit: number, context: string): string {
+  const chars = [...label];
+  if (chars.length <= limit) return label;
+  logger.warn(`${context} exceeded ${limit} chars (${chars.length}), truncating: "${label}"`);
+  return chars.slice(0, limit - 1).join('') + '…';
+}
+
 /**
  * Sends a plain text message to a phone number via the WhatsApp Cloud API.
  */
@@ -139,7 +158,7 @@ export async function sendWhatsAppButtons(
       action: {
         buttons: buttons.slice(0, 3).map((b, i) => ({
           type: "reply",
-          reply: { id: ids?.[i] ?? `btn_${i}`, title: b },
+          reply: { id: ids?.[i] ?? `btn_${i}`, title: clampLabel(b, BUTTON_TITLE_LIMIT, 'Button title') },
         })),
       },
     },
@@ -187,8 +206,16 @@ export async function sendWhatsAppList(
       type: "list",
       body: { text: clampBody(body, 'List') },
       action: {
-        button: buttonText,
-        sections: [{ rows: rows.slice(0, 10) }],
+        button: clampLabel(buttonText, LIST_BUTTON_LIMIT, 'List button'),
+        sections: [{
+          rows: rows.slice(0, 10).map((row) => ({
+            ...row,
+            title: clampLabel(row.title, LIST_ROW_TITLE_LIMIT, 'List row title'),
+            ...(row.description
+              ? { description: clampLabel(row.description, LIST_ROW_DESCRIPTION_LIMIT, 'List row description') }
+              : {}),
+          })),
+        }],
       },
     },
   };
