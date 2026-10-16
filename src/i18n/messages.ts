@@ -530,7 +530,7 @@ const pt: Messages = {
       `_Já agora — não encontrei ${missingNames.join(', ')}, por isso ${missingNames.length > 1 ? 'não ficaram' : 'não ficou'} no teu pedido abaixo._`,
     alternativesListBody: (productName, count) =>
       `Encontrei ${count} alternativa${count > 1 ? 's' : ''} para *${productName}*. Qual preferes? 👇`,
-    alternativeSkipOption: () => `Nenhuma, seguir sem este item`,
+    alternativeSkipOption: () => `Nenhuma, saltar item`,
     noAlternativesFound: (productName) =>
       `Desculpa, não encontrei nenhuma alternativa para *${productName}* no momento — vou deixá-lo de fora do teu pedido.`,
     proformaSentChoosePayment: () =>
@@ -545,7 +545,7 @@ const pt: Messages = {
     askPartTypeBody: (count) =>
       `Antes de procurar — que tipo de peça${count > 1 ? 's' : ''} preferes?` +
       (count > 1 ? `\n\n_Aplica-se a${count > 1 ? 's' : ''} ${count} peças do teu pedido._` : ''),
-    askPartTypeButton: () => 'Escolher tipo de peça',
+    askPartTypeButton: () => 'Ver tipos de peça',
     partTypeRows: [
       { id: 'oem', title: 'OEM', description: 'Peça original do fabricante' },
       { id: 'aftermarket', title: 'Aftermarket', description: 'Peça compatível, outras marcas' },
