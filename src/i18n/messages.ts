@@ -1099,7 +1099,7 @@ const en: Messages = {
       `_Quick note — I couldn't find ${missingNames.join(', ')}, so ${missingNames.length > 1 ? "they're" : "it's"} not included in your order below._`,
     alternativesListBody: (productName, count) =>
       `Found ${count} alternative${count > 1 ? 's' : ''} for *${productName}*. Which one works for you? 👇`,
-    alternativeSkipOption: () => `None of these, skip this item`,
+    alternativeSkipOption: () => `None, skip this item`,
     noAlternativesFound: (productName) =>
       `Sorry, I couldn't find any alternatives for *${productName}* right now — I'll leave it out of your order.`,
     proformaSentChoosePayment: () =>
