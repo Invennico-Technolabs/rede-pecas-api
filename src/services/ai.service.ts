@@ -23,6 +23,27 @@ export interface VisionData {
   body_type?: string | null;
 }
 
+const VISION_TEXT_FIELDS = [
+  'reason', 'make', 'model', 'year', 'license_plate', 'chassis_number',
+  'engine_number', 'engine_size', 'fuel_type', 'color', 'body_type',
+] as const;
+
+/**
+ * Coerces the model's parsed JSON into the declared VisionData shape. The
+ * model doesn't reliably honour the prompt's string types — e.g. it returns
+ * `"year": 2014` as a number, which crashed isPlausibleYear's `.replace()`
+ * and aborted the whole webhook turn — so every text field becomes a trimmed
+ * string, or null when missing/empty.
+ */
+function normalizeVisionData(parsed: Record<string, unknown>): VisionData {
+  const data: VisionData = { document: true, valid: parsed.valid === true };
+  for (const field of VISION_TEXT_FIELDS) {
+    const value = parsed[field];
+    data[field] = value === null || value === undefined || String(value).trim() === '' ? null : String(value).trim();
+  }
+  return data;
+}
+
 /**
  * Sends a vehicle document/VIN photo to Claude Vision and parses back the
  * extracted vehicle fields (make, model, chassis number, etc), returning null
@@ -78,6 +99,17 @@ with valid JSON:
   "owner": null
 }
 
+ANGOLAN LIVRETE (Viação e Trânsito) — map its printed labels to the JSON fields like this:
+- "Marca" -> make (e.g. KIA, MITSUBISHI)
+- "Modelo" -> model: the model NAME only, without trim/engine/year suffixes
+  (e.g. "L200-4X4-2,50-2014" -> "L200", "SPORTAGE 2.0 CRDI" -> "SPORTAGE")
+- "Nº do Quadro" -> chassis_number (this IS the VIN)
+- "Nº do Motor" -> engine_number
+- "Matrícula" -> license_plate
+- "Cilindrada" -> engine_size in litres (e.g. "2477 c.c." -> "2.5")
+- "Combustível" -> fuel_type ("Gasóleo" = Diesel, "Gasolina" = Gasoline)
+- year -> the model year if printed; otherwise the year of "Data do Primeiro Registo"
+
 IMPORTANT RULES:
 - A photo that clearly shows a 17-character chassis number (VIN) is always valid (valid: true), even if
   no other field is visible — make/model/year can be null, the VIN alone is enough
@@ -102,7 +134,7 @@ IMPORTANT RULES:
     try {
       const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
       if (!parsed.document) return null;
-      return parsed as VisionData;
+      return normalizeVisionData(parsed);
     } catch {
       logger.error(`Error parsing vision model JSON: ${text}`);
       return { valid: false, reason: "Erro ao interpretar o documento." } as VisionData;

@@ -17,6 +17,8 @@ export interface Customer {
   active: boolean;
   needs_review: boolean;
   needs_review_reason: string | null;
+  // Conversation language — only ever set by the customer's explicit choice.
+  locale: 'pt' | 'en' | null;
 }
 
 /**

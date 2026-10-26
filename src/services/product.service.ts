@@ -41,6 +41,8 @@ import { getAllAdmins } from '../models/adminUser.model.js';
 import { resolveMessages, resolveLocale } from './customer.service.js';
 import { sendWhatsAppMessage, sendWhatsAppButtons } from './whatsapp.service.js';
 import { sendReply, sendReplyButtons, sendReplyList } from './reply.service.js';
+import { extractBoldTerms } from './humanize.service.js';
+import { extractProductNames } from './ai.service.js';
 import { generateProformaPDF, sendProformaWhatsApp } from './pdf.service.js';
 import { askPaymentMethod } from './payment.service.js';
 import { startOrderProfileCapture } from './orderProfile.service.js';
@@ -65,6 +67,7 @@ import {
   savePendingAlternativeResolution,
   getPendingAlternativeResolution,
   clearPendingAlternativeResolution,
+  savePendingPartTypeChoice,
   clearPendingPartTypeChoice,
   savePendingBasketWaitlistOffer,
   clearPendingBasketWaitlistOffer,
@@ -155,6 +158,11 @@ export async function searchAndRespond(phone: string, customerText: string, cust
 export async function startBasketSearch(phone: string, productNames: string[], customerName: string, partType: string = ''): Promise<void> {
   const messages = await resolveMessages(phone);
   await sendReply(phone, messages.agent.basketRequestSummary(productNames, customerName));
+  // Sent once for the whole basket — searchNextBasketItem deliberately
+  // doesn't repeat it per item, since items after the first are searched
+  // right after the customer's previous pick (or back-to-back when an item
+  // has no match), and a fresh "checking stock" each time reads as spam.
+  await sendReply(phone, messages.agent.checkingStock());
 
   await savePendingBasket(phone, { queue: productNames, items: [], partType, unmatched: [] });
   await searchNextBasketItem(phone, customerName);
@@ -181,6 +189,18 @@ function buildPartTypeListRows(rows: { id: string; title: string; description: s
 }
 
 /**
+ * Turns a customer's free-text part request into the part-type question:
+ * Claude splits it into part phrases, the phrases are held as the pending
+ * part-type choice, and the OEM/Aftermarket/New/Used list is sent. Shared by
+ * the controller's search fallback and the resumed request after a vehicle pick.
+ */
+export async function beginPartTypeChoice(phone: string, customerText: string, customerName: string): Promise<void> {
+  const productNames = await extractProductNames(customerText);
+  await savePendingPartTypeChoice(phone, { productNames, customerText, customerName });
+  await sendPartTypePrompt(phone, productNames);
+}
+
+/**
  * Sends the one-time-per-order "what type of parts?" list, asked once
  * Claude has identified the part(s) from the customer's message and before
  * any search runs.
@@ -188,11 +208,15 @@ function buildPartTypeListRows(rows: { id: string; title: string; description: s
 export async function sendPartTypePrompt(phone: string, productNames: string[] | null): Promise<void> {
   const messages = await resolveMessages(phone);
   const count = productNames?.length || 1;
+  const body = messages.agent.askPartTypeBody(count);
+  // preserve the bold type names so a humanized rewrite can't drift into the
+  // persona's generic "Parts, Accessories, Lubricants or Services" range.
   await sendReplyList(
     phone,
-    messages.agent.askPartTypeBody(count),
+    body,
     messages.agent.askPartTypeButton(),
-    buildPartTypeListRows(messages.agent.partTypeRows)
+    buildPartTypeListRows(messages.agent.partTypeRows),
+    { preserve: extractBoldTerms(body) }
   );
 }
 
@@ -227,7 +251,11 @@ export async function processPartTypeChoice(
   if (pending.productNames && pending.productNames.length > 1) {
     await startBasketSearch(phone, pending.productNames, pending.customerName, partType);
   } else {
-    await searchAndRespond(phone, pending.customerText, pending.customerName, partType);
+    // Search the extracted part phrase, not the raw message — search is
+    // all-words matching, so filler like "I need ... please" would otherwise
+    // fail every query. Falls back to the raw text if extraction failed.
+    const part = pending.productNames?.[0] ?? pending.customerText;
+    await searchAndRespond(phone, part, pending.customerName, partType);
   }
   return true;
 }
@@ -250,7 +278,6 @@ async function searchNextBasketItem(phone: string, customerName: string): Promis
 
   const messages = await resolveMessages(phone);
   logger.info(`[PRODUCT SEARCH][BASKET] ${phone} searching basket item: "${part}"`);
-  await sendReply(phone, messages.agent.checkingStock());
 
   const { vehicle, options } = await runProductSearch(phone, part, basket.partType || null);
 
@@ -847,16 +874,17 @@ async function searchAlternativesForNextItem(orderNumber: string, phone: string)
   const messages = await resolveMessages(phone);
   const vehicle = await resolveSearchVehicle(phone);
   const excludeProductIds = [item.productId, ...(item.excludedProductIds || [])];
-  // Constrain to the rejected product's own subcategory (e.g. 'Brakes') —
-  // otherwise the OR-joined full-text query can match on just one common
-  // word in its name and surface a completely unrelated part as an
-  // "alternative". See searchProductsInInventory's subcategory param.
+  // Any-word match on the rejected product's full name, constrained to its
+  // own subcategory (e.g. 'Brakes') — otherwise one common word in its name
+  // could surface a completely unrelated part as an "alternative". See
+  // searchProductsInInventory's subcategory/matchMode params.
   const rejectedProduct = await getProductByIdAnyStatus(item.productId);
   const options = await searchProductsInInventory({
     part: item.productName,
     vehicle,
     excludeProductIds,
     subcategory: rejectedProduct?.subcategory,
+    matchMode: 'any',
   });
 
   if (!options.length) {
@@ -1078,6 +1106,7 @@ export async function processStockUnavailableChoice(
       vehicle,
       excludeProductIds: [offer.productId],
       subcategory: rejectedProduct?.subcategory,
+      matchMode: 'any',
     });
     if (!options.length) {
       await sendReplyButtons(phone, messages.agent.noStockFound(), messages.agent.noStockFoundButtons);

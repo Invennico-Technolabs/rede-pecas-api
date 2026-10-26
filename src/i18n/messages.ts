@@ -9,10 +9,18 @@ interface Messages {
     notUnderstood: () => string;
     alreadyAnswered: () => string;
     accountInactive: () => string;
+    courtesyReply: () => string;
   };
   onboarding: {
     welcome: () => string;
     welcomeBack: (name: string) => string;
+    mainMenuBody: (name: string) => string;
+    mainMenuListButton: () => string;
+    mainMenuRows: { searchParts: string; orderStatus: string; addVehicle: string };
+    // Label of the option that switches TO the other language — so it's
+    // written in that other language ("🌐 English" in the pt bundle).
+    switchLanguageOption: () => string;
+    languageSwitched: () => string;
     resumeRegistration: () => string;
     askNameOnly: () => string;
     askVehicleIdBody: (name: string) => string;
@@ -296,6 +304,8 @@ const pt: Messages = {
       `🤔 Essa já foi respondida! Vê a última mensagem para continuares.`,
     accountInactive: () =>
       `⚠️ A sua conta está inactiva. A nossa equipa de suporte entrará em contacto consigo em breve.`,
+    courtesyReply: () =>
+      `De nada! 😊 Se precisares de mais alguma coisa, é só dizer.`,
   },
   /**
    * Customer profile registration flow — welcome/greeting, name/NIF/address
@@ -312,6 +322,13 @@ const pt: Messages = {
       `Vamos começar! Como te chamas?`,
     welcomeBack: (name) =>
       `👋 Olá de novo, *${name}*! Bem-vindo de volta à *Rede Peças*. 😊`,
+    mainMenuBody: (name) =>
+      `👋 Olá de novo, *${name}*! Bem-vindo de volta à *Rede Peças*. 😊\n\n` +
+      `Como te posso ajudar hoje?`,
+    mainMenuListButton: () => 'Ver opções',
+    mainMenuRows: { searchParts: '🔎 Procurar peças', orderStatus: '📦 Estado do pedido', addVehicle: '➕ Outro carro' },
+    switchLanguageOption: () => '🌐 English',
+    languageSwitched: () => `✅ Idioma alterado para *Português*.`,
     resumeRegistration: () =>
       `👋 Vamos continuar o teu registo!`,
     askNameOnly: () => `*Como te chamas?* 👇`,
@@ -458,7 +475,7 @@ const pt: Messages = {
       `Queres que eu faça isso?`,
     noStockFoundButtons: ['✅ Sim, avisa-me', '❌ Não, obrigado'],
     noStockFoundNoWaitlist: () =>
-      `Infelizmente não encontrei essa peça, nem nada parecido, no nosso catálogo neste momento. 😔`,
+      `Lamento, mas de momento não temos essa peça, nem nada parecido, disponível no nosso catálogo. 😔`,
     optionNotFound: () =>
       `Não consegui identificar a opção escolhida. Por favor responde com o número (ex: 1, 2 ou 3).`,
     serviceUnavailable: () =>
@@ -543,7 +560,7 @@ const pt: Messages = {
       `Boas notícias, ${name}! 🙌 Encontrei ${count} opção(ões) de *${part}* para o teu *${make} ${model} ${year}*. Escolhe uma abaixo 👇`,
     searchListButton: () => 'Ver opções',
     askPartTypeBody: (count) =>
-      `Antes de procurar — que tipo de peça${count > 1 ? 's' : ''} preferes?` +
+      `Que tipo de peça procuras? *OEM*, *Aftermarket*, *Nova* ou *Usada*?` +
       (count > 1 ? `\n\n_Aplica-se a${count > 1 ? 's' : ''} ${count} peças do teu pedido._` : ''),
     askPartTypeButton: () => 'Ver tipos de peça',
     partTypeRows: [
@@ -863,6 +880,8 @@ const en: Messages = {
       `🤔 Already answered that one! Check my latest message to continue.`,
     accountInactive: () =>
       `⚠️ Your account is currently inactive. Our support team will reach out to you shortly.`,
+    courtesyReply: () =>
+      `You're welcome! 😊 If you need anything else, just let me know.`,
   },
   /**
    * Customer profile registration flow — welcome/greeting, name/NIF/address
@@ -879,6 +898,13 @@ const en: Messages = {
       `Let's get started! What's your name?`,
     welcomeBack: (name) =>
       `👋 Hey again, *${name}*! Welcome back to *Rede Peças*. 😊`,
+    mainMenuBody: (name) =>
+      `👋 Hey again, *${name}*! Welcome back to *Rede Peças*. 😊\n\n` +
+      `How can I help you today?`,
+    mainMenuListButton: () => 'See options',
+    mainMenuRows: { searchParts: '🔎 Search parts', orderStatus: '📦 Order status', addVehicle: '➕ Add vehicle' },
+    switchLanguageOption: () => '🌐 Português',
+    languageSwitched: () => `✅ Language changed to *English*.`,
     resumeRegistration: () =>
       `👋 Let's continue your registration!`,
     askNameOnly: () => `*What's your name?* 👇`,
@@ -1112,14 +1138,14 @@ const en: Messages = {
       `Good news, ${name}! 🙌 I found ${count} option(s) for *${part}* for your *${make} ${model} ${year}*. Which one works best for you? 👇`,
     searchListButton: () => 'View options',
     askPartTypeBody: (count) =>
-      `Before I search — what type of part${count > 1 ? 's' : ''} would you like?` +
+      `What type of part are you after? *OEM*, *Aftermarket*, *New*, or *Used*?` +
       (count > 1 ? `\n\n_This applies to all ${count} parts in your list._` : ''),
     askPartTypeButton: () => 'Choose part type',
     partTypeRows: [
       { id: 'oem', title: 'OEM', description: 'Original manufacturer part' },
       { id: 'aftermarket', title: 'Aftermarket', description: 'Compatible part, other brands' },
       { id: 'new', title: 'New', description: 'Brand new, unused' },
-      { id: 'second_hand', title: 'Second Hand', description: 'Used, tested, lower price' },
+      { id: 'second_hand', title: 'Used', description: 'Second hand, tested, lower price' },
     ],
     partTypeNotUnderstood: () => 'Please tap the button above and choose one of the four types. 👇',
   },

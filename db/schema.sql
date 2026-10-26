@@ -722,15 +722,16 @@ CREATE TABLE IF NOT EXISTS customers (
   contact_count        INT DEFAULT 1,
   active               BOOLEAN DEFAULT true,
   needs_review         BOOLEAN DEFAULT false,   -- set when a profile field was accepted after exhausting validation retries
-  needs_review_reason  TEXT                     -- which field(s) failed validation and why, for admin follow-up
+  needs_review_reason  TEXT,                    -- which field(s) failed validation and why, for admin follow-up
+  locale               TEXT DEFAULT 'pt'        -- 'pt' | 'en' — conversation language, set ONLY by the customer's explicit choice (🌐 menu/welcome button)
 );
 
--- Conversation locale used to be stamped here once from the customer's first
--- message and never re-evaluated (sticky) — removed as of 2026-07-17 in favor
--- of per-message detection cached in Redis session state (session.service.ts's
--- saveLocale/getLocale), so a customer switching language mid-conversation
--- gets answered in whatever they just typed instead of a frozen locale.
-ALTER TABLE customers DROP COLUMN IF EXISTS locale;
+-- Conversation locale history: 2026-07-17 removed a column that was guessed
+-- once from the first message, in favor of per-message detection; 2026-10-26
+-- removed that detection too (an isolated "Hi" flipped an Angolan customer to
+-- English) and brought the column back — Angolan Portuguese by default, English
+-- only when the customer explicitly picks it. Never inferred from message text.
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS locale TEXT DEFAULT 'pt';
 
 -- Added 2026-07-27 — flags a profile field that was accepted with a
 -- needs_review reason after exhausting validation retries (see validation.service.ts).

@@ -129,13 +129,52 @@ function detectProseLocale(text: string): 'pt' | 'en' | null {
   return ptScore > enScore ? 'pt' : 'en';
 }
 
+// Slang/colloquial fillers the persona must never use (persona.ts TONE AND
+// STYLE). A rewrite containing one the original didn't is rejected, so the
+// canned text is sent instead — the prompt alone was not enough to stop the
+// model from adding "mate" / "Ó pá" / "Bem-vindo, meu!". Unicode-aware
+// boundaries, since \b doesn't treat "á"/"ó" as word characters.
+const SLANG_PATTERNS: RegExp[] = [
+  /(?<!\p{L})(mate|buddy|pal|bro|dude|mano|kota|bu[ée]|fixe)(?!\p{L})/iu,
+  /(?<!\p{L})(ó\s*pá|pá)(?!\p{L})/iu,
+  /(?<!\p{L})meu\s*[!?.,]/iu, // "meu" as a form of address, not "o meu pedido"
+  /(?<!\p{L})ó\s+\p{Lu}/u,     // "Ó Dorivaldo!" opening
+  // Brazilian Portuguese markers — Angola follows the European-Portuguese norm.
+  /(?<!\p{L})(pô|né|a gente|tá ligado)(?!\p{L})/iu,
+  // "estou verificando" (PT-AO: "estou a verificar") — gerunds end -ando/-endo/-indo; "quando" isn't one.
+  /(?<!\p{L})(estou|estamos|está|estás|estão|vou estar)\s+(?!quando(?!\p{L}))\p{L}+[aei]ndo(?!\p{L})/iu,
+];
+
+/**
+ * Returns the first slang pattern found in `out` that isn't already present
+ * in `original` (a canned text quoting a word verbatim is not the model's slang).
+ */
+function findAddedSlang(original: string, out: string): string | null {
+  // Only the *bold* markers are dropped (not the span), so "Ó *Dorivaldo*!" still matches.
+  const text = out.replace(/\*/g, '');
+  for (const pattern of SLANG_PATTERNS) {
+    const match = text.match(pattern);
+    if (match && !pattern.test(original)) return match[0];
+  }
+  return null;
+}
+
+// One short hash of each locale's system prompt, folded into the cache key —
+// so any persona change stops serving rewrites cached under the old prompt,
+// instead of letting them live out their 24h TTL.
+const PROMPT_HASH: Record<'pt' | 'en', string> = {
+  pt: createHash('sha1').update(buildHumanizePrompt('pt')).digest('hex').slice(0, 8),
+  en: createHash('sha1').update(buildHumanizePrompt('en')).digest('hex').slice(0, 8),
+};
+
 /**
  * Builds a deterministic Redis cache key for a humanized rewrite, hashing
- * the original text and its context so the same input reuses a previous rewrite.
+ * the original text and its context so the same input reuses a previous
+ * rewrite — scoped to the current persona prompt version.
  */
 function cacheKey(text: string, opts: HumanizeOptions, context: string): string {
   const hash = createHash('sha1').update(`${text}|${context}`).digest('hex');
-  return `humanized:${opts.locale}:${hash}`;
+  return `humanized:${opts.locale}:${PROMPT_HASH[opts.locale]}:${hash}`;
 }
 
 interface ValidationResult {
@@ -167,6 +206,11 @@ function validate(original: string, candidate: string, opts: HumanizeOptions): V
 
   if (opts.locale === 'en' && PT_ONLY_CHARS.test(stripNeutralSegments(out))) {
     return { ok: false, reason: 'pt-characters-in-english-output' };
+  }
+
+  const slang = findAddedSlang(original, out);
+  if (slang) {
+    return { ok: false, reason: `slang ("${slang}")` };
   }
 
   const limit = opts.maxLength ?? TEXT_BODY_LIMIT;

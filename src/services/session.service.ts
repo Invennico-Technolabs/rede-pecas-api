@@ -93,8 +93,8 @@ export const clearPendingBasket = (phone: string): Promise<void> => deleteKey(`b
 // --- Part-type choice (OEM/Aftermarket/New/Second Hand) --------------------
 
 export interface PendingPartTypeChoice {
-  productNames: string[] | null; // null/single-item search vs. a multi-item basket request
-  customerText: string;          // original free text, re-used to run the search once resolved
+  productNames: string[] | null; // Claude-extracted part phrases (2+ = basket); null if extraction failed
+  customerText: string;          // original free text — search fallback when productNames is null
   customerName: string;
 }
 
@@ -291,6 +291,34 @@ export async function getChosenVehicle(phone: string): Promise<number | null> {
   const data = await getString(`chosenVehicle:${phone}`);
   return data ? parseInt(data, 10) : null;
 }
+
+/**
+ * Forgets the session's chosen vehicle, so the next request asks "which vehicle is this for?" again.
+ */
+export const clearChosenVehicle = (phone: string): Promise<void> => deleteKey(`chosenVehicle:${phone}`);
+
+export interface DeferredPartRequest {
+  customerText: string;
+  customerName: string;
+}
+
+/**
+ * Holds a typed part request while the customer is asked which vehicle it's
+ * for, so the search can continue once they pick without them retyping it.
+ */
+export const saveDeferredPartRequest = (phone: string, request: DeferredPartRequest): Promise<void> =>
+  setJSON(`deferredPartRequest:${phone}`, request);
+
+/**
+ * Retrieves the part request waiting on a vehicle choice, if any.
+ */
+export const getDeferredPartRequest = (phone: string): Promise<DeferredPartRequest | null> =>
+  getJSON(`deferredPartRequest:${phone}`);
+
+/**
+ * Removes the part request waiting on a vehicle choice.
+ */
+export const clearDeferredPartRequest = (phone: string): Promise<void> => deleteKey(`deferredPartRequest:${phone}`);
 
 /**
  * Marks that the vehicle-ID entry option buttons (VIN/photo/manual) were just shown to this phone.
@@ -621,6 +649,17 @@ const INACTIVE_CUSTOMER_ALERT_TTL = 60 * 60 * 6;
  */
 export const claimInactiveCustomerAlert = (phone: string): Promise<boolean> =>
   claimKey(`inactiveAlert:${phone}`, INACTIVE_CUSTOMER_ALERT_TTL);
+
+// A "thanks" -> "You're welcome" -> "ok" chain must not keep answering
+// itself, but a thank-you after a later, separate exchange deserves a reply.
+const COURTESY_REPLY_TTL = 60 * 10;
+
+/**
+ * Returns true at most once per COURTESY_REPLY_TTL window per phone — gates
+ * the "You're welcome" reply to a pure courtesy message (thanks / okay).
+ */
+export const claimCourtesyReply = (phone: string): Promise<boolean> =>
+  claimKey(`courtesyReply:${phone}`, COURTESY_REPLY_TTL);
 
 // --- Chat transcript --------------------------------------------------------
 

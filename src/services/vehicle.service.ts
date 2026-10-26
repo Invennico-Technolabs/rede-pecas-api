@@ -11,6 +11,7 @@ import {
   startManualCollection,
   getNhtsaVehicle,
   saveNhtsaVehicle,
+  VehicleSession,
 } from '../models/vehicle.model.js';
 import { downloadWhatsAppMedia, sendWhatsAppButtons } from './whatsapp.service.js';
 import { saveDocument } from './storage.service.js';
@@ -18,12 +19,17 @@ import { sendReply, sendReplyButtons } from './reply.service.js';
 import { extractBoldTerms } from './humanize.service.js';
 import { extractDataWithClaudeVision, VisionData } from './ai.service.js';
 import { completeOnboardingIfNeeded, resolveMessages, Customer } from './customer.service.js';
+import { beginPartTypeChoice } from './product.service.js';
 import {
   markPartPromptSent,
   savePendingVehicleChoice,
   getPendingVehicleChoice,
   clearPendingVehicleChoice,
   saveChosenVehicle,
+  getChosenVehicle,
+  saveDeferredPartRequest,
+  getDeferredPartRequest,
+  clearDeferredPartRequest,
   markVehicleIdChoiceShown,
   clearVehicleIdChoiceShown,
   markVinDuplicateChoiceShown,
@@ -53,32 +59,61 @@ import {
 export { getActiveManualCollection, startManualCollection };
 
 /**
- * Sends the "what part do you need" prompt for a customer with a
- * confirmed vehicle on file — directly if they have one vehicle, or first
- * asking which vehicle it's for when they have several.
+ * Sends the numbered "which vehicle is this for?" menu (even for a single
+ * vehicle, so the customer can say it's for a different car) and holds the
+ * list as the pending choice for resolvePendingVehicleChoice.
+ */
+async function sendVehicleChoicePrompt(phone: string, vehicles: VehicleSession[], greeting?: { name: string }): Promise<void> {
+  const messages = await resolveMessages(phone);
+  await savePendingVehicleChoice(phone, vehicles.map(v => ({ id: v.id, make: v.make, model: v.model, year: v.year })));
+  const chooseBody = messages.vehicleConfirm.chooseVehiclePrompt(vehicles, greeting?.name);
+  // The "➕ Add vehicle" button means a customer whose query is for a car not
+  // in the list isn't stuck re-typing a number — the tap is caught by the
+  // add-vehicle check (isAddVehicleRequest) before resolvePendingVehicleChoice
+  // ever sees it.
+  await sendReplyButtons(
+    phone,
+    chooseBody,
+    [messages.vehicleConfirm.addVehicleButton()],
+    undefined,
+    undefined,
+    { preserve: extractBoldTerms(chooseBody) }
+  );
+}
+
+/**
+ * Starts a part search for a customer with a confirmed vehicle on file by
+ * first asking which vehicle it's for — the "what part do you need" prompt
+ * follows the pick (resolvePendingVehicleChoice).
  */
 export async function sendAskPartPrompt(phone: string, greeting?: { name: string }): Promise<boolean> {
-  const messages = await resolveMessages(phone);
   const vehicles = await getCustomerVehicles(phone);
   if (!vehicles.length) return false;
 
-  if (vehicles.length === 1) {
-    const v = vehicles[0];
-    const body = messages.vehicleConfirm.confirmedAskPart(v.make, v.model, v.year, greeting?.name);
-    await sendReplyButtons(phone, body, [messages.vehicleConfirm.addVehicleButton()]);
-    await markPartPromptSent(phone);
-    return true;
-  }
+  await sendVehicleChoicePrompt(phone, vehicles, greeting);
+  return true;
+}
 
-  await savePendingVehicleChoice(phone, vehicles.map(v => ({ id: v.id, make: v.make, model: v.model, year: v.year })));
-  const chooseBody = messages.vehicleConfirm.chooseVehiclePrompt(vehicles, greeting?.name);
-  await sendReply(phone, chooseBody, { preserve: extractBoldTerms(chooseBody) });
+/**
+ * Asks which vehicle a typed part request is for when none has been picked
+ * yet this session, holding the request so the search resumes right after
+ * the pick. Returns false (nothing sent) when a vehicle is already chosen or
+ * the customer has none on file.
+ */
+export async function askVehicleChoiceForRequest(phone: string, customerText: string, customerName: string): Promise<boolean> {
+  if (await getChosenVehicle(phone)) return false;
+  const vehicles = await getCustomerVehicles(phone);
+  if (!vehicles.length) return false;
+
+  await saveDeferredPartRequest(phone, { customerText, customerName });
+  await sendVehicleChoicePrompt(phone, vehicles);
   return true;
 }
 
 /**
  * Resolves a customer's reply to the "which vehicle is this for?" prompt,
- * remembering the chosen vehicle and moving on to the part-search prompt.
+ * remembering the chosen vehicle, then either resuming the part request
+ * that was waiting on this choice or sending the part-search prompt.
  */
 export async function resolvePendingVehicleChoice(phone: string, reply: string): Promise<boolean> {
   const messages = await resolveMessages(phone);
@@ -95,6 +130,15 @@ export async function resolvePendingVehicleChoice(phone: string, reply: string):
 
   await clearPendingVehicleChoice(phone);
   await saveChosenVehicle(phone, chosen.id);
+
+  const deferred = await getDeferredPartRequest(phone);
+  if (deferred) {
+    await clearDeferredPartRequest(phone);
+    await markPartPromptSent(phone);
+    await beginPartTypeChoice(phone, deferred.customerText, deferred.customerName);
+    return true;
+  }
+
   await sendReplyButtons(
     phone,
     messages.vehicleConfirm.confirmedAskPart(chosen.make, chosen.model, chosen.year),
@@ -127,6 +171,12 @@ export function isAddVehicleRequest(text: string): boolean {
  * customer adding another vehicle to their account.
  */
 export async function startAddVehicleFlow(phone: string): Promise<void> {
+  // Drop any unanswered "which vehicle is this for?" menu — otherwise its
+  // pending choice would intercept the new vehicle's Sim/Não confirmation
+  // as an invalid vehicle number and re-ask forever. A typed request that was
+  // waiting on that choice is dropped too — it was for a car not on file.
+  await clearPendingVehicleChoice(phone);
+  await clearDeferredPartRequest(phone);
   const messages = await resolveMessages(phone);
   await sendReplyButtons(phone, messages.vehicleConfirm.addVehicleBody(), messages.onboarding.askVehicleIdButtons);
   await markVehicleIdChoiceShown(phone);
@@ -613,11 +663,16 @@ export async function processVehicleDocument(phone: string, mediaId: string): Pr
     chassisChecksumValid = isValidVinChecksum(extracted.chassis_number);
     const decoded = await decodeVIN(extracted.chassis_number.toUpperCase());
     if (decoded) {
-      make = decoded.make;
-      model = decoded.model;
-      year = decoded.year;
-      fuelType = decoded.fuel_type;
-      engineSize = decoded.engine;
+      // NHTSA wins for every field it actually resolved, but a partial
+      // decode must not erase what was read off the document — non-US-market
+      // VINs (e.g. Kia Sportage KNAP…, Toyota JP, VW DE) often come back as
+      // make + year with a null model, which used to wipe the livrete's
+      // "SPORTAGE" and fail with missingEssentialData every time.
+      make = decoded.make || make;
+      model = decoded.model || model;
+      year = decoded.year || year;
+      fuelType = decoded.fuel_type || fuelType;
+      engineSize = decoded.engine || engineSize;
       nhtsaConfirmed = true;
     }
   }
@@ -629,6 +684,10 @@ export async function processVehicleDocument(phone: string, mediaId: string): Pr
   }
 
   if (!make || !model) {
+    logger.info(
+      `[VISION] Missing make/model for ${phone}: vision make="${extracted.make}" model="${extracted.model}" ` +
+      `chassis="${extracted.chassis_number}" nhtsaDecoded=${nhtsaConfirmed} -> make="${make}" model="${model}"`
+    );
     await sendRetryOrManualPrompt(phone, messages.document.missingEssentialData());
     return;
   }

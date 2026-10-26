@@ -1,16 +1,22 @@
 import {
   getAndUpdateCustomer,
+  getCustomerByPhone,
   createCustomerPreRegistration,
   updateCustomer,
   Customer
 } from '../models/customer.model.js';
-import { sendReply, sendReplyButtons } from './reply.service.js';
+import { sendReply, sendReplyButtons, sendReplyList } from './reply.service.js';
 import { extractBoldTerms } from './humanize.service.js';
-import { sendWhatsAppMessage } from './whatsapp.service.js';
+import { sendWhatsAppMessage, sendWhatsAppButtons } from './whatsapp.service.js';
 import {
+  saveLocale,
+  saveActivePromptId,
   markSessionActive,
   markPartPromptSent,
   markVehicleIdChoiceShown,
+  clearChosenVehicle,
+  clearPendingVehicleChoice,
+  clearDeferredPartRequest,
   getLocale,
   saveCustomerName,
   incrementValidationAttempts,
@@ -23,11 +29,47 @@ import { isPlausibleName, flagForReview, MAX_VALIDATION_ATTEMPTS } from './valid
 export type { Customer };
 
 /**
- * Resolves the locale to use for a phone's customer-facing replies, falling
- * back to the app's default locale when nothing has been detected yet this session.
+ * Resolves the locale for a phone's customer-facing replies: the customer's
+ * explicitly chosen `customers.locale` (cached in the session so every send
+ * in a turn doesn't hit the DB), else the default Angolan Portuguese. Never
+ * inferred from message text — an isolated "Hi" must not flip the language.
  */
 export async function resolveLocale(phone: string): Promise<'pt' | 'en'> {
-  return (await getLocale(phone)) ?? DEFAULT_LOCALE;
+  const cached = await getLocale(phone);
+  if (cached) return cached;
+
+  const customer = await getCustomerByPhone(phone);
+  const locale = customer?.locale === 'en' || customer?.locale === 'pt' ? customer.locale : DEFAULT_LOCALE;
+  await saveLocale(phone, locale);
+  return locale;
+}
+
+/**
+ * Persists a customer's explicit language choice and refreshes the session cache.
+ */
+async function setCustomerLocale(phone: string, locale: 'pt' | 'en'): Promise<void> {
+  await updateCustomer(phone, { locale });
+  await saveLocale(phone, locale);
+}
+
+// Id of the "🌐 English / 🌐 Português" option — a button on the first
+// welcome, a row in the main menu list. Routed in whatsapp.controller.ts.
+export const SWITCH_LANGUAGE_ID = 'lang_switch';
+
+/**
+ * Sends the first-contact welcome (which ends by asking the customer's name)
+ * with a button to switch the conversation language. Sent raw, not
+ * humanized, like before — it's the fixed brand introduction.
+ */
+async function sendWelcome(phone: string): Promise<void> {
+  const messages = await resolveMessages(phone);
+  const res = await sendWhatsAppButtons(
+    phone,
+    messages.onboarding.welcome(),
+    [messages.onboarding.switchLanguageOption()],
+    [SWITCH_LANGUAGE_ID]
+  );
+  await saveActivePromptId(phone, res?.messages?.[0]?.id);
 }
 
 /**
@@ -51,7 +93,7 @@ export async function getOrCreateCustomer(phone: string): Promise<Customer | nul
 
   await createCustomerPreRegistration(phone, 'awaiting_name');
   await markSessionActive(phone);
-  await sendWhatsAppMessage(phone, (await resolveMessages(phone)).onboarding.welcome());
+  await sendWelcome(phone);
   return null;
 }
 
@@ -103,6 +145,56 @@ export async function sendResumeRegistrationPrompt(phone: string, customer: Cust
     const askName = messages.onboarding.askNameOnly();
     await sendReply(phone, askName, { preserve: extractBoldTerms(askName) });
   }
+}
+
+/**
+ * Sends the returning-customer greeting menu as a List Message (Search parts
+ * / Order status / Add vehicle / 🌐 switch language) instead of jumping
+ * straight to a vehicle question. Row ids use the `menu_` prefix (routed in
+ * whatsapp.controller.ts), except the language row, which shares
+ * SWITCH_LANGUAGE_ID with the welcome button. Starts a fresh intent: the
+ * session's chosen vehicle and any half-asked vehicle choice are forgotten,
+ * so the next request asks which vehicle again, and free text typed after
+ * the menu is treated as a part search.
+ */
+export async function sendMainMenu(phone: string, firstName: string): Promise<void> {
+  await clearChosenVehicle(phone);
+  await clearPendingVehicleChoice(phone);
+  await clearDeferredPartRequest(phone);
+  await markPartPromptSent(phone);
+
+  const messages = await resolveMessages(phone);
+  const rows = messages.onboarding.mainMenuRows;
+  await sendReplyList(
+    phone,
+    messages.onboarding.mainMenuBody(firstName),
+    messages.onboarding.mainMenuListButton(),
+    [
+      { id: 'menu_search_parts', title: rows.searchParts },
+      { id: 'menu_order_status', title: rows.orderStatus },
+      { id: 'menu_add_vehicle', title: rows.addVehicle },
+      { id: SWITCH_LANGUAGE_ID, title: messages.onboarding.switchLanguageOption() },
+    ],
+    { contextual: true }
+  );
+}
+
+/**
+ * Handles the 🌐 language option (welcome button or menu row): flips the
+ * customer's saved language between Portuguese and English, confirms in the
+ * new language, then re-sends what they were looking at — the welcome (still
+ * asking their name) during registration, otherwise the main menu.
+ */
+export async function switchLanguage(phone: string, customer: Customer): Promise<void> {
+  const next = (await resolveLocale(phone)) === 'pt' ? 'en' : 'pt';
+  await setCustomerLocale(phone, next);
+  await sendWhatsAppMessage(phone, getMessages(next).onboarding.languageSwitched());
+
+  if (customer.registration_status !== 'complete') {
+    await sendWelcome(phone);
+    return;
+  }
+  await sendMainMenu(phone, customer.name?.split(' ')[0] || 'Cliente');
 }
 
 /**

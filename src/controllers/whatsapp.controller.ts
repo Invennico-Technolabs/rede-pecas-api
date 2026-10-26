@@ -7,17 +7,14 @@ import * as orderProfileService from '../services/orderProfile.service.js';
 import * as orderStatusService from '../services/orderStatus.service.js';
 import * as paymentService from '../services/payment.service.js';
 import * as sessionService from '../services/session.service.js';
-import { extractProductNames } from '../services/ai.service.js';
 import { sendReply, sendReplyButtons } from '../services/reply.service.js';
 import { sendWhatsAppButtons, sendTypingIndicator, sendWhatsAppMessage } from '../services/whatsapp.service.js';
 import { getAdminByPhone, getAllAdmins } from '../models/adminUser.model.js';
 import { config } from '../config/config.js';
-import { GREETING_PATTERN, detectMessageLocale } from '../utils/greeting.js';
+import { GREETING_PATTERN, isCourtesyMessage } from '../utils/greeting.js';
 import { runSerialized } from '../utils/keyedQueue.js';
 
 const HUMAN_HANDOFF_PATTERN = /\b(atendente|humano|falar com (algu[eé]m|pessoa)|operador|suporte humano|human|agent|representative)\b/i;
-
-const ACKNOWLEDGMENT_PATTERN = /^(ok(ay)?|k+|t[áa]\s*bem|obrigad[oa]s?|valeu|thanks?|thank\s*you|cool|perfeito|beleza|👍+|🙏+|✅+)[.!?\s]*$/i;
 
 const ORDER_STATUS_PATTERN = /\b(estado do (meu )?pedido|onde est[áa] (o meu )?pedido|order status|where('?s| is) my order)\b/i;
 
@@ -120,9 +117,10 @@ async function processMessageFlow(
     return;
   }
 
+  // No language detection from message text — the conversation stays in
+  // Angolan Portuguese unless the customer explicitly picks English (🌐
+  // option, routed below). See customerService.resolveLocale.
   if (customerText) {
-    const detected = detectMessageLocale(customerText);
-    if (detected) await sessionService.saveLocale(phone, detected);
     await sessionService.saveLastMessage(phone, customerText);
   }
 
@@ -159,12 +157,18 @@ async function processMessageFlow(
     : false;
 
   if (freshSession && customer.registration_status === 'complete' && !needsVehicleId) {
-    const firstName = customer.name?.split(' ')[0] || 'Cliente';
-    await sendReply(phone, messages.onboarding.welcomeBack(firstName), { contextual: true });
-    if (!mediaId) {
-      const askedPart = await vehicleService.sendAskPartPrompt(phone);
-      if (askedPart) return;
+    const isGreeting = !!customerText && GREETING_PATTERN.test(customerText.trim());
+    if (!mediaId && !activeCollection && (isGreeting || mediaType === 'interactive')) {
+      // A greeting (or a tap on a prompt from a previous session) gets the
+      // main menu — no vehicle question until the customer says what they want.
+      await customerService.sendMainMenu(phone, firstName);
+      return;
     }
+    await sendReply(phone, messages.onboarding.welcomeBack(firstName), { contextual: true });
+    // A real request as the session's first message (e.g. "engine oil") is
+    // processed below instead of being dropped — the vehicle question comes
+    // from the search fallback. Media (e.g. a payment proof) falls through as before.
+    if (!mediaId) await sessionService.markPartPromptSent(phone);
   }
 
   if (freshSession && needsVehicleId) {
@@ -184,6 +188,26 @@ async function processMessageFlow(
       await sendReply(phone, messages.common.alreadyAnswered());
       return;
     }
+  }
+
+  // 🌐 language option — a button on the first welcome or a row in the main
+  // menu. Routed before registration so it's never taken as the customer's name.
+  if (buttonReplyId === customerService.SWITCH_LANGUAGE_ID || listReplyId === customerService.SWITCH_LANGUAGE_ID) {
+    await customerService.switchLanguage(phone, customer);
+    return;
+  }
+
+  // Main-menu list taps (customerService.sendMainMenu) — only ever shown to a
+  // customer with a complete profile and a vehicle on file.
+  if (listReplyId?.startsWith('menu_') && customer.registration_status === 'complete' && !needsVehicleId) {
+    if (listReplyId === 'menu_search_parts') {
+      await vehicleService.sendAskPartPrompt(phone);
+    } else if (listReplyId === 'menu_order_status') {
+      await orderStatusService.handleOrderStatusRequest(phone, customer);
+    } else if (listReplyId === 'menu_add_vehicle') {
+      await vehicleService.startAddVehicleFlow(phone);
+    }
+    return;
   }
 
   if (buttonReplyId?.startsWith('order_status_')) {
@@ -339,11 +363,15 @@ async function processMessageFlow(
     if (handled) return;
   }
 
-  const invitedToAskForPart = await sessionService.wasPartPromptSent(phone);
   const isGreeting = GREETING_PATTERN.test(customerText.trim());
-  if (!invitedToAskForPart || isGreeting) {
-    const greeting = isGreeting ? { name: customer.name?.split(' ')[0] || 'Cliente' } : undefined;
-    const asked = await vehicleService.sendAskPartPrompt(phone, greeting);
+  if (isGreeting && await vehicleService.hasVehicleOnFile(phone)) {
+    await customerService.sendMainMenu(phone, firstName);
+    return;
+  }
+
+  const invitedToAskForPart = await sessionService.wasPartPromptSent(phone);
+  if (!invitedToAskForPart) {
+    const asked = await vehicleService.sendAskPartPrompt(phone);
     if (asked) return;
   }
 
@@ -368,8 +396,14 @@ async function processMessageFlow(
     return;
   }
 
-  if (ACKNOWLEDGMENT_PATTERN.test(customerText.trim())) {
-    logger.info(`[PRODUCT SEARCH] ${phone} sent a filler acknowledgment ("${customerText}") — not treating it as a search.`);
+  // "Thank you for the support" / "ok obrigado" — e.g. after a "not in
+  // stock" reply — is never a part search. One polite reply, throttled so a
+  // thanks -> "you're welcome" -> "ok" chain doesn't keep answering itself.
+  if (isCourtesyMessage(customerText)) {
+    logger.info(`[PRODUCT SEARCH] ${phone} sent a courtesy message ("${customerText}") — not treating it as a search.`);
+    if (await sessionService.claimCourtesyReply(phone)) {
+      await sendReply(phone, messages.common.courtesyReply(), { contextual: true });
+    }
     return;
   }
 
@@ -378,11 +412,9 @@ async function processMessageFlow(
     return;
   }
 
-  const productNames = await extractProductNames(customerText);
-  await sessionService.savePendingPartTypeChoice(phone, {
-    productNames: productNames && productNames.length > 1 ? productNames : null,
-    customerText,
-    customerName: firstName,
-  });
-  await productService.sendPartTypePrompt(phone, productNames);
+  // Ask which vehicle this request is for (if none picked yet this session)
+  // before anything else — the request resumes right after the pick.
+  if (await vehicleService.askVehicleChoiceForRequest(phone, customerText, firstName)) return;
+
+  await productService.beginPartTypeChoice(phone, customerText, firstName);
 }

@@ -232,6 +232,7 @@ Table customers {
   active boolean [default: true]
   needs_review boolean [default: false, note: 'set when a profile field was accepted after exhausting validation retries']
   needs_review_reason text [note: 'which field(s) failed validation and why, for admin follow-up']
+  locale text [default: 'pt', note: 'pt | en — conversation language, set only by the customer explicitly choosing it (🌐 menu/welcome button), never detected']
 
   indexes {
     registration_status
