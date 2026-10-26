@@ -11,9 +11,11 @@ export interface AdminAlert {
 
 /**
  * Inserts a new row into `admin_alerts` for the in-panel notification feed —
- * called on payment-proof-received and in-person-payment-requested events.
+ * called on payment-proof-received, in-person-payment-requested, order-status
+ * and supplier-inquiry events. `orderNumber` is null for alerts not tied to
+ * an order (a supplier inquiry happens before any order exists).
  */
-export async function createAlert(type: string, orderNumber: string, message: string): Promise<void> {
+export async function createAlert(type: string, orderNumber: string | null, message: string): Promise<void> {
   await db.query(
     `INSERT INTO admin_alerts (type, order_number, message) VALUES ($1, $2, $3)`,
     [type, orderNumber, message]

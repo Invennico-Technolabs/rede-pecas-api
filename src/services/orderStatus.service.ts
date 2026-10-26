@@ -6,7 +6,7 @@ import { createAlert } from '../models/alert.model.js';
 import { sendWhatsAppMessage } from './whatsapp.service.js';
 import { sendReply } from './reply.service.js';
 import { resolveMessages } from './customer.service.js';
-import { formatPrice } from '../utils/helpers.js';
+import { formatPrice, formatAddressWithMap } from '../utils/helpers.js';
 import { t } from '../i18n/messages.js';
 
 /**
@@ -47,7 +47,7 @@ async function notifyAdminsAndAckCustomer(order: any, customer: Customer | null)
     formatPrice(amount),
     customerName,
     order.customer_phone,
-    customer?.address || 'N/A'
+    formatAddressWithMap(customer?.address, customer?.address_lat, customer?.address_lng, 'N/A')
   );
 
   await createAlert('order_status_request', order.number, message);

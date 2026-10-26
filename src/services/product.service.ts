@@ -39,7 +39,8 @@ import { getCustomerVehicles } from '../models/vehicle.model.js';
 import { getCustomerByPhone } from '../models/customer.model.js';
 import { getAllAdmins } from '../models/adminUser.model.js';
 import { resolveMessages, resolveLocale } from './customer.service.js';
-import { sendWhatsAppMessage, sendWhatsAppButtons } from './whatsapp.service.js';
+import { sendWhatsAppMessage, sendWhatsAppButtons, sendWhatsAppImage } from './whatsapp.service.js';
+import { createAlert } from '../models/alert.model.js';
 import { sendReply, sendReplyButtons, sendReplyList } from './reply.service.js';
 import { extractBoldTerms } from './humanize.service.js';
 import { extractProductNames } from './ai.service.js';
@@ -50,6 +51,11 @@ import {
   savePendingOptions,
   clearPendingOptions,
   savePendingWaitlistOffer,
+  savePendingSupplierInquiryOffer,
+  clearPendingSupplierInquiryOffer,
+  saveAwaitingSupplierInquiryDetails,
+  clearAwaitingSupplierInquiryDetails,
+  SupplierInquiry,
   clearPendingWaitlistOffer,
   savePendingServiceOffer,
   clearPendingServiceOffer,
@@ -128,9 +134,10 @@ export async function searchAndRespond(phone: string, customerText: string, cust
       await savePendingWaitlistOffer(phone, { productId: candidate.id, productName: candidate.name, query: customerText });
     } else {
       // Nothing at all matched — not even an out-of-stock listing — so
-      // there's no real product to waitlist against. Distinct wording from
-      // noStockFound() above: no question, no promise we can't keep.
-      await sendReply(phone, messages.agent.noStockFoundNoWaitlist());
+      // there's no real product to waitlist against. Instead offer to have
+      // the team check with suppliers directly (processSupplierInquiryOffer).
+      await sendReplyButtons(phone, messages.agent.noStockFoundNoWaitlist(), messages.agent.supplierInquiryButtons);
+      await savePendingSupplierInquiryOffer(phone, { query: customerText });
     }
     return;
   }
@@ -194,8 +201,15 @@ function buildPartTypeListRows(rows: { id: string; title: string; description: s
  * part-type choice, and the OEM/Aftermarket/New/Used list is sent. Shared by
  * the controller's search fallback and the resumed request after a vehicle pick.
  */
-export async function beginPartTypeChoice(phone: string, customerText: string, customerName: string): Promise<void> {
-  const productNames = await extractProductNames(customerText);
+export async function beginPartTypeChoice(
+  phone: string,
+  customerText: string,
+  customerName: string,
+  // Already-extracted part phrases (the controller extracts before asking
+  // which vehicle); undefined means "extract now".
+  extracted?: string[] | null
+): Promise<void> {
+  const productNames = extracted !== undefined ? extracted : await extractProductNames(customerText);
   await savePendingPartTypeChoice(phone, { productNames, customerText, customerName });
   await sendPartTypePrompt(phone, productNames);
 }
@@ -415,7 +429,8 @@ async function advanceBasket(phone: string): Promise<void> {
         candidates: Array.from(candidates, ([productId, productName]) => ({ productId, productName })),
       });
     } else {
-      await sendReply(phone, messages.agent.basketSearchAllUnavailableNoWaitlist());
+      await sendReplyButtons(phone, messages.agent.basketSearchAllUnavailableNoWaitlist(), messages.agent.supplierInquiryButtons);
+      await savePendingSupplierInquiryOffer(phone, { query: basket.unmatched.map((u) => u.query).join(', ') });
     }
     return;
   }
@@ -1296,6 +1311,71 @@ export async function processServiceSelection(
 }
 
 const WAITLIST_YES_EXTRA = /\b(add\s*me|notify\s*me|wait\s*list|waitlist|join\s*(the\s*)?waitlist|avisa[- ]?me|lista\s*de\s*espera)\b/i;
+
+const SUPPLIER_INQUIRY_YES_EXTRA = /\b(verificar|check|verifica)\b/i;
+
+/**
+ * Handles the reply to the zero-results "should our team check with
+ * suppliers?" offer: on yes, asks for a part photo or reference (the next
+ * message is caught by submitSupplierInquiry); on no, acknowledges. Anything
+ * else falls through (returns false) like the other yes/no offers — it's
+ * more likely a new request than a misunderstood answer.
+ */
+export async function processSupplierInquiryOffer(phone: string, reply: string, offer: SupplierInquiry): Promise<boolean> {
+  const messages = await resolveMessages(phone);
+
+  if (isAffirmativeReply(reply, SUPPLIER_INQUIRY_YES_EXTRA)) {
+    await clearPendingSupplierInquiryOffer(phone);
+    await saveAwaitingSupplierInquiryDetails(phone, offer);
+    const askDetails = messages.agent.supplierInquiryAskDetails();
+    await sendReply(phone, askDetails, { preserve: extractBoldTerms(askDetails) });
+    return true;
+  }
+  if (isNegativeReply(reply)) {
+    await clearPendingSupplierInquiryOffer(phone);
+    await sendReply(phone, messages.agent.waitlistDeclined());
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Forwards a supplier inquiry — the part photo (re-sent by its WhatsApp
+ * media id) or typed reference/description, plus who's asking, their vehicle
+ * and what they originally searched — to every admin over WhatsApp, logs it
+ * to admin_alerts, and tells the customer the team will contact them. The
+ * team follows up with the customer directly; there's no bot-side reply flow.
+ */
+export async function submitSupplierInquiry(
+  phone: string,
+  customerName: string,
+  inquiry: SupplierInquiry,
+  details: { text: string | null; imageMediaId: string | null }
+): Promise<void> {
+  await clearAwaitingSupplierInquiryDetails(phone);
+
+  const vehicle = await resolveSearchVehicle(phone);
+  const vehicleSummary = vehicle ? `${vehicle.make} ${vehicle.model} ${vehicle.year}` : '—';
+  const detailsText = details.text?.trim() || (details.imageMediaId ? '📷 (photo attached)' : '—');
+  const body = t.admin.supplierInquiry(customerName, phone, vehicleSummary, inquiry.query, detailsText);
+
+  for (const admin of await getAllAdmins()) {
+    try {
+      if (details.imageMediaId) {
+        await sendWhatsAppImage(admin.phone, details.imageMediaId, body);
+      } else {
+        await sendWhatsAppMessage(admin.phone, body);
+      }
+    } catch (error: any) {
+      logger.error(`Error notifying admin ${admin.phone} about supplier inquiry from ${phone}: ${error.message}`);
+    }
+  }
+  await createAlert('supplier_inquiry', null, body);
+  logger.info(`[SUPPLIER INQUIRY] ${phone} asked the team to check "${inquiry.query}" (${details.imageMediaId ? 'photo' : 'text'})`);
+
+  const messages = await resolveMessages(phone);
+  await sendReply(phone, messages.agent.supplierInquiryReceived());
+}
 
 /**
  * Handles the customer's reply to a "join the waitlist?" offer for an

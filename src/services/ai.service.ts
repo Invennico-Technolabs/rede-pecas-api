@@ -230,10 +230,12 @@ IMPORTANT RULES:
  * codebase's "no conversational AI in the message pipeline" rule alongside
  * `validation.service.ts`'s `validateFreeText` (see CLAUDE.md): a single-shot
  * judgment call, no history, no system prompt, no JSON action dispatch.
- * Fails OPEN by returning null on any network/API error or unparseable
- * response, so the caller falls back to treating the whole message as one
- * single-product search — today's unchanged behavior — rather than ever
- * blocking a search on an Anthropic outage.
+ * Returns an EMPTY array when the message isn't a part request at all
+ * (greeting, yes/no, a delivery question, a name/NIF/address typed after its
+ * prompt expired…) — the caller must not search then. Fails OPEN by
+ * returning null on any network/API error or unparseable response, so the
+ * caller falls back to treating the whole message as one single-product
+ * search rather than ever blocking a search on an Anthropic outage.
  */
 export async function extractProductNames(customerText: string): Promise<string[] | null> {
   try {
@@ -242,14 +244,17 @@ export async function extractProductNames(customerText: string): Promise<string[
       max_tokens: 300,
       messages: [{
         role: "user",
-        content: `A customer sent this WhatsApp message to an auto-parts store, asking for one or more
-parts: "${customerText}"
+        content: `A customer sent this WhatsApp message to an auto-parts store: "${customerText}"
 
 Identify each DISTINCT part/product they're asking for, as a short search phrase suitable for a
 parts-catalog full-text search (e.g. "filtro de óleo", "pastilhas de travão dianteiras") — not a
 rewrite of the whole message, not synonyms, no invented parts they didn't mention. If the message
-names only one product (or nothing clearly product-like), respond with an array containing just
-that one phrase (or the original message text verbatim if nothing product-like is identifiable).
+names only one product, respond with an array containing just that one phrase. A bare part name,
+part reference/code (e.g. "W712/75", "90915-YZZD2") or brand+part counts as a request.
+
+If the message is NOT asking for a part or product — e.g. a greeting, thanks, a yes/no answer, a
+question about delivery, payment, prices in general, opening hours or an order, a person's name,
+an address, a tax number (NIF), or small talk — respond with an EMPTY array: {"products": []}.
 
 Respond ONLY with valid JSON, no additional text:
 {"products": ["phrase1", "phrase2", ...]}`,
@@ -260,10 +265,13 @@ Respond ONLY with valid JSON, no additional text:
 
     try {
       const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
-      const products = Array.isArray(parsed.products)
-        ? parsed.products.map((p: any) => String(p).trim()).filter((p: string) => p.length > 0)
-        : [];
-      return products.length > 0 ? products : [customerText];
+      if (!Array.isArray(parsed.products)) {
+        logger.error(`Product-extraction JSON has no products array: ${text}`);
+        return null;
+      }
+      // [] is a real answer — "this message isn't a part request" — and the
+      // caller must NOT search on it.
+      return parsed.products.map((p: any) => String(p).trim()).filter((p: string) => p.length > 0);
     } catch {
       logger.error(`Error parsing product-extraction model JSON: ${text}`);
       return null;

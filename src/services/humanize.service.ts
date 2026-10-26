@@ -140,7 +140,7 @@ const SLANG_PATTERNS: RegExp[] = [
   /(?<!\p{L})meu\s*[!?.,]/iu, // "meu" as a form of address, not "o meu pedido"
   /(?<!\p{L})ó\s+\p{Lu}/u,     // "Ó Dorivaldo!" opening
   // Brazilian Portuguese markers — Angola follows the European-Portuguese norm.
-  /(?<!\p{L})(pô|né|a gente|tá ligado)(?!\p{L})/iu,
+  /(?<!\p{L})(pô|né|a gente|tá ligado|tô|tou)(?!\p{L})/iu, // "tô"/"tou" = spoken "estou"
   // "estou verificando" (PT-AO: "estou a verificar") — gerunds end -ando/-endo/-indo; "quando" isn't one.
   /(?<!\p{L})(estou|estamos|está|estás|estão|vou estar)\s+(?!quando(?!\p{L}))\p{L}+[aei]ndo(?!\p{L})/iu,
 ];

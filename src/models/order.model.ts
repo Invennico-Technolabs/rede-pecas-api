@@ -301,6 +301,14 @@ export async function updateOrderStatus(orderNumber: string, status: string, add
   const setClauses = [`status = $2`, `updated_at = NOW()`];
   const params: any[] = [orderNumber, status];
 
+  // Start (or restart, when a swapped-in alternative needs its own admin
+  // decision) the stock-confirmation wait clock the courtesy/admin-reminder
+  // sweeps measure from — not created_at, which predates the order-profile
+  // step and made "sorry for the delay" fire right after "let me check".
+  if (status === 'awaiting_stock_confirmation') {
+    setClauses.push(`stock_confirmation_requested_at = NOW()`);
+  }
+
   if (additionalFields.approved_by) {
     setClauses.push(`approved_by = $${setClauses.length + 2}`);
     params.push(additionalFields.approved_by);
@@ -445,7 +453,7 @@ export async function getOrdersAwaitingCourtesyMessage(minMinutes: number): Prom
     `SELECT number, customer_phone FROM orders
      WHERE status = 'awaiting_stock_confirmation'
        AND stock_confirmation_courtesy_sent = false
-       AND created_at < NOW() - ($1 || ' minutes')::interval`,
+       AND COALESCE(stock_confirmation_requested_at, created_at) < NOW() - ($1 || ' minutes')::interval`,
     [minMinutes]
   );
   return rows;
@@ -482,7 +490,7 @@ export async function getOrdersAwaitingAdminReminder(minMinutes: number): Promis
      LEFT JOIN customers c ON c.phone = o.customer_phone
      WHERE o.status = 'awaiting_stock_confirmation'
        AND o.stock_confirmation_admin_reminder_sent = false
-       AND o.created_at < NOW() - ($1 || ' minutes')::interval`,
+       AND COALESCE(o.stock_confirmation_requested_at, o.created_at) < NOW() - ($1 || ' minutes')::interval`,
     [minMinutes]
   );
   return rows;

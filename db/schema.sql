@@ -510,6 +510,11 @@ CREATE TABLE IF NOT EXISTS orders (
   -- Set once the 15-minute admin-reminder WhatsApp nudge has gone out for this
   -- order, so the sweep in product.service.ts never resends it.
   stock_confirmation_admin_reminder_sent BOOLEAN DEFAULT false,
+  -- When the order last entered awaiting_stock_confirmation (set by
+  -- updateOrderStatus). Both sweeps above measure their 20/15-minute wait
+  -- from here — created_at predates the per-order NIF/address step, so it
+  -- made the courtesy fire right after the "let me check" message.
+  stock_confirmation_requested_at TIMESTAMPTZ,
   -- Purely an admin-panel display concern — hides an approved order from the
   -- admin grid (DELETE /admin/orders/:number, only ever allowed on an already-
   -- 'approved' order) without touching status, the customer's order, or
@@ -542,6 +547,7 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS service_price NUMERIC(12,2);
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS admin_hidden BOOLEAN DEFAULT false;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS stock_confirmation_courtesy_sent BOOLEAN DEFAULT false;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS stock_confirmation_admin_reminder_sent BOOLEAN DEFAULT false;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS stock_confirmation_requested_at TIMESTAMPTZ;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS items JSONB;
 -- One part-type choice (OEM/Aftermarket/New/Second Hand) per order, asked
 -- once before search and applied to every part in it — not per line item.
@@ -628,8 +634,8 @@ END $$;
 -- ============================================================
 CREATE TABLE IF NOT EXISTS admin_alerts (
   id            SERIAL PRIMARY KEY,
-  type          TEXT NOT NULL,              -- 'payment_proof' | 'in_person_payment' | 'order_status_request'
-  order_number  TEXT REFERENCES orders(number),
+  type          TEXT NOT NULL,              -- 'payment_proof' | 'in_person_payment' | 'order_status_request' | 'supplier_inquiry'
+  order_number  TEXT REFERENCES orders(number), -- NULL for 'supplier_inquiry' (no order exists yet)
   message       TEXT NOT NULL,
   read_at       TIMESTAMPTZ,
   created_at    TIMESTAMPTZ DEFAULT NOW()
@@ -723,7 +729,12 @@ CREATE TABLE IF NOT EXISTS customers (
   active               BOOLEAN DEFAULT true,
   needs_review         BOOLEAN DEFAULT false,   -- set when a profile field was accepted after exhausting validation retries
   needs_review_reason  TEXT,                    -- which field(s) failed validation and why, for admin follow-up
-  locale               TEXT DEFAULT 'pt'        -- 'pt' | 'en' — conversation language, set ONLY by the customer's explicit choice (🌐 menu/welcome button)
+  locale               TEXT DEFAULT 'pt',       -- 'pt' | 'en' — conversation language, set ONLY by the customer's explicit choice (🌐 menu/welcome button)
+  -- Delivery-point coordinates from a shared WhatsApp location (last known,
+  -- like address). NULL when the address was typed. `address` still holds the
+  -- readable form (place + landmark) for PDFs/couriers.
+  address_lat          NUMERIC(9,6),
+  address_lng          NUMERIC(9,6)
 );
 
 -- Conversation locale history: 2026-07-17 removed a column that was guessed
@@ -732,6 +743,9 @@ CREATE TABLE IF NOT EXISTS customers (
 -- English) and brought the column back — Angolan Portuguese by default, English
 -- only when the customer explicitly picks it. Never inferred from message text.
 ALTER TABLE customers ADD COLUMN IF NOT EXISTS locale TEXT DEFAULT 'pt';
+-- Added 2026-10-26 — delivery point from a shared WhatsApp location.
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS address_lat NUMERIC(9,6);
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS address_lng NUMERIC(9,6);
 
 -- Added 2026-07-27 — flags a profile field that was accepted with a
 -- needs_review reason after exhausting validation retries (see validation.service.ts).

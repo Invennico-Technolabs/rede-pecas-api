@@ -10,7 +10,7 @@ import { getSupplierPhoneById } from '../models/supplier.model.js';
 import { getCustomerByPhone } from '../models/customer.model.js';
 import { getAllAdmins, getAdminByPhone } from '../models/adminUser.model.js';
 import { createAlert } from '../models/alert.model.js';
-import { formatPrice } from '../utils/helpers.js';
+import { formatPrice, formatAddressWithMap } from '../utils/helpers.js';
 import { t, getMessages } from '../i18n/messages.js';
 import { resolveMessages, resolveLocale } from './customer.service.js';
 
@@ -433,7 +433,7 @@ async function notifyAgentInPersonPayment(
 
   const customer = await getCustomerByPhone(customerPhone);
   const customerName = customer?.name?.split(' ')[0] || 'Cliente';
-  const address = customer?.address || 'N/D';
+  const address = formatAddressWithMap(customer?.address, customer?.address_lat, customer?.address_lng, 'N/D');
 
   const body = t.admin.inPersonPaymentRequested(
     orderNumber,

@@ -68,3 +68,24 @@ export function isCourtesyMessage(text: string): boolean {
   const allCourtesy = words.every((w) => COURTESY_CORE_WORDS.has(w) || COURTESY_FILLER_WORDS.has(w));
   return allCourtesy && words.some((w) => COURTESY_CORE_WORDS.has(w));
 }
+
+// A bare yes/no or a stray 1–2 digit number with no open question to answer
+// — e.g. a reply to a prompt whose state expired. Never a part search.
+const BARE_REPLY_PATTERN = /^(sim|s|n[ãa]o|n|yes|y|no|nope|\d{1,2})[.!?\s]*$/i;
+
+// An individual's NIF (= BI number: 9 digits + 2-letter province + 3 digits,
+// e.g. "005123456LA042"), typed after its order-profile prompt expired.
+// Claude reads it as a part reference code, so it's excluded here. The plain
+// 9–10 digit company-NIF form is deliberately NOT — it collides with real
+// part numbers (e.g. Bosch "0986494018").
+const INDIVIDUAL_NIF_PATTERN = /^\d{9}[A-Z]{2}\d{3}$/i;
+
+/**
+ * Checks whether a message is a reply that can never be a part request on
+ * its own — a bare yes/no, a 1–2 digit number, or an individual NIF — so the
+ * search fallback rejects it deterministically before calling Claude.
+ */
+export function isBareReply(text: string): boolean {
+  const trimmed = text.trim();
+  return BARE_REPLY_PATTERN.test(trimmed) || INDIVIDUAL_NIF_PATTERN.test(trimmed.replace(/\s/g, ''));
+}

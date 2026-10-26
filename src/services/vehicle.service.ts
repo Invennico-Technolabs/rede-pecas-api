@@ -100,12 +100,17 @@ export async function sendAskPartPrompt(phone: string, greeting?: { name: string
  * the pick. Returns false (nothing sent) when a vehicle is already chosen or
  * the customer has none on file.
  */
-export async function askVehicleChoiceForRequest(phone: string, customerText: string, customerName: string): Promise<boolean> {
+export async function askVehicleChoiceForRequest(
+  phone: string,
+  customerText: string,
+  customerName: string,
+  productNames: string[] | null
+): Promise<boolean> {
   if (await getChosenVehicle(phone)) return false;
   const vehicles = await getCustomerVehicles(phone);
   if (!vehicles.length) return false;
 
-  await saveDeferredPartRequest(phone, { customerText, customerName });
+  await saveDeferredPartRequest(phone, { customerText, customerName, productNames });
   await sendVehicleChoicePrompt(phone, vehicles);
   return true;
 }
@@ -135,7 +140,7 @@ export async function resolvePendingVehicleChoice(phone: string, reply: string):
   if (deferred) {
     await clearDeferredPartRequest(phone);
     await markPartPromptSent(phone);
-    await beginPartTypeChoice(phone, deferred.customerText, deferred.customerName);
+    await beginPartTypeChoice(phone, deferred.customerText, deferred.customerName, deferred.productNames);
     return true;
   }
 

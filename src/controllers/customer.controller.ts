@@ -76,7 +76,13 @@ export const updateCustomerHandler = catchAsync(async (req: Request, res: Respon
   const fields: Partial<Customer> = {};
   if (name !== undefined) fields.name = name;
   if (nif !== undefined) fields.nif = nif;
-  if (address !== undefined) fields.address = address;
+  if (address !== undefined && address !== existing.address) {
+    // A hand-edited address no longer matches the shared WhatsApp location
+    // pin, so drop the coordinates rather than keep a stale Maps link.
+    fields.address = address;
+    fields.address_lat = null;
+    fields.address_lng = null;
+  }
   if (email !== undefined) fields.email = email;
 
   await updateCustomer(phone, fields);
