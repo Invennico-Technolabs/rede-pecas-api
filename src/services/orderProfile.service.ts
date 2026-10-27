@@ -1,11 +1,12 @@
 import { getCustomerByPhone, updateCustomer } from '../models/customer.model.js';
-import { getLatestOrderByStatus } from '../models/order.model.js';
+import { getLatestOrderByStatus, updateOrderStatus } from '../models/order.model.js';
 import { logger } from '../config/logger.js';
 import { sendReply, sendReplyButtons, sendReplyLocationRequest } from './reply.service.js';
 import { extractBoldTerms } from './humanize.service.js';
 import { resolveMessages } from './customer.service.js';
-import { requestStockConfirmation } from './product.service.js';
+import { sendProformaAndAskPayment } from './product.service.js';
 import {
+  markSessionActive,
   savePendingOrderProfileShortcut,
   clearPendingOrderProfileShortcut,
   saveOrderProfileStage,
@@ -19,11 +20,17 @@ import { isPlausibleNif, validateFreeText, flagForReview, MAX_VALIDATION_ATTEMPT
 
 /**
  * Kicks off (or shortcuts) the individual/company + NIF + address capture
- * for a just-confirmed order, right before stock is checked with suppliers
- * — see CLAUDE.md's message pipeline for where this replaces the old
- * registration-time NIF/address stages.
+ * for an order whose stock the supplier has just confirmed — the proforma
+ * and payment follow once it completes. See CLAUDE.md's message pipeline for
+ * where this replaces the old registration-time NIF/address stages.
  */
 export async function startOrderProfileCapture(phone: string, orderNumber: string): Promise<void> {
+  await updateOrderStatus(orderNumber, 'awaiting_customer_details');
+  // Admin can confirm stock hours after the customer's last message — keep
+  // the session alive so their tap on the prompt below isn't taken as a
+  // fresh-session opener (which answers with the main menu instead).
+  await markSessionActive(phone);
+
   const messages = await resolveMessages(phone);
   const customer = await getCustomerByPhone(phone);
   const firstName = customer?.name?.split(' ')[0] || 'Cliente';
@@ -55,7 +62,7 @@ export async function startOrderProfileCapture(phone: string, orderNumber: strin
 
 /**
  * Handles the customer's reply to the saved-profile shortcut: "use saved"
- * proceeds straight to stock confirmation, "edit" drops into the fresh
+ * proceeds straight to the proforma and payment, "edit" drops into the fresh
  * wizard (overwriting the saved profile), anything else re-sends the
  * identical prompt rather than guessing.
  */
@@ -66,7 +73,7 @@ export async function processProfileShortcutReply(
 ): Promise<boolean> {
   if (buttonReplyId === 'order_profile_use_saved') {
     await clearPendingOrderProfileShortcut(phone);
-    await requestStockConfirmation(phone, pending.orderNumber);
+    await sendProformaAndAskPayment(phone, pending.orderNumber);
     return true;
   }
 
@@ -98,7 +105,7 @@ export async function processProfileShortcutReply(
 /**
  * Commits the captured customer_type/nif/address to the customer's profile
  * (last-known values, reused as the saved-profile shortcut on future orders)
- * and proceeds to stock confirmation for this order.
+ * and proceeds to the proforma and payment for this order.
  */
 async function finalizeOrderProfile(
   phone: string,
@@ -110,10 +117,10 @@ async function finalizeOrderProfile(
 ): Promise<void> {
   // Save first, clear the wizard after: if the DB write throws, the stage
   // survives and the customer's retry still lands in the wizard, instead of
-  // the order being stranded at awaiting_payment with its state gone.
+  // the order being stranded at awaiting_customer_details with its state gone.
   await updateCustomer(phone, { customer_type: customerType, nif, address, address_lat: coords.lat, address_lng: coords.lng });
   await clearOrderProfileStage(phone);
-  await requestStockConfirmation(phone, orderNumber);
+  await sendProformaAndAskPayment(phone, orderNumber);
 }
 
 // How far back an unfinished order may be resumed — the session TTL, so a
@@ -122,13 +129,13 @@ const RESUMABLE_ORDER_MAX_AGE_MS = 4 * 60 * 60 * 1000;
 
 /**
  * Restarts the profile capture (individual/company + NIF + address) for the
- * customer's latest order still at `awaiting_payment` — created, but never
- * sent to stock confirmation — when its wizard state was lost (session
- * expiry, restart, a failed step). Returns false when there's no such
- * recent order.
+ * customer's latest order still at `awaiting_customer_details` — stock
+ * confirmed, but the proforma never sent — when its wizard state was lost
+ * (session expiry, restart, a failed step). Returns false when there's no
+ * such recent order.
  */
 export async function resumeOrderProfileCapture(phone: string): Promise<boolean> {
-  const order = await getLatestOrderByStatus(phone, ['awaiting_payment']);
+  const order = await getLatestOrderByStatus(phone, ['awaiting_customer_details']);
   if (!order || Date.now() - new Date(order.created_at).getTime() > RESUMABLE_ORDER_MAX_AGE_MS) return false;
   logger.info(`[ORDER PROFILE] ${phone} resuming lost profile capture for order ${order.number}`);
   await startOrderProfileCapture(phone, order.number);
@@ -220,7 +227,7 @@ const NIF_NO_PATTERN = /\b(n[ãa]o|no|nope)\b|❌|^n$|^2$/i;
  * step, branching by path: company asks NIF first (required, validated,
  * re-asked on failure) then address; individual asks address first, then an
  * optional NIF yes/no, then the NIF number only if yes. The final step of
- * either path commits the profile and moves on to stock confirmation.
+ * either path commits the profile and moves on to the proforma and payment.
  */
 export async function processOrderProfileStep(
   phone: string,

@@ -17,7 +17,7 @@ import { downloadWhatsAppMedia, sendWhatsAppButtons } from './whatsapp.service.j
 import { saveDocument } from './storage.service.js';
 import { sendReply, sendReplyButtons } from './reply.service.js';
 import { extractBoldTerms } from './humanize.service.js';
-import { extractDataWithClaudeVision, VisionData } from './ai.service.js';
+import { extractDataWithClaudeVision, extractVehicleDetails, VisionData } from './ai.service.js';
 import { completeOnboardingIfNeeded, resolveMessages, Customer } from './customer.service.js';
 import { beginPartTypeChoice } from './product.service.js';
 import {
@@ -366,10 +366,140 @@ export async function processVinDuplicateChoice(phone: string, reply: string): P
   return true;
 }
 
+type ManualVehicleField = 'make' | 'model' | 'year';
+type ManualVehicleDetails = Record<ManualVehicleField, string | null>;
+
+const MANUAL_VEHICLE_FIELDS: ManualVehicleField[] = ['make', 'model', 'year'];
+
+const MANUAL_STEP_FIELD: Record<string, ManualVehicleField> = {
+  awaiting_make: 'make',
+  awaiting_model: 'model',
+  awaiting_year: 'year',
+};
+
+const MANUAL_FIELD_VALIDATION_KEY: Record<ManualVehicleField, 'vehicleMake' | 'vehicleModel' | 'vehicleYear'> = {
+  make: 'vehicleMake',
+  model: 'vehicleModel',
+  year: 'vehicleYear',
+};
+
 /**
- * Advances the manual vehicle-entry step machine one step (make → model →
- * year → engine number) based on the collection's current status, saving the
- * vehicle and completing onboarding once all steps are done.
+ * Normalizes and validates one manual-entry vehicle field. Returns the clean
+ * value to store, or null to drop it. Only the field the current step asked
+ * for is strict — an invalid value is re-asked (up to MAX_VALIDATION_ATTEMPTS,
+ * then flagged and accepted, as before) and `'reask'` is returned; a bonus
+ * field the customer volunteered early is silently dropped when invalid,
+ * since its own step will ask for it anyway.
+ */
+async function validateManualVehicleField(
+  phone: string,
+  collectionId: number,
+  field: ManualVehicleField,
+  rawValue: string,
+  details: ManualVehicleDetails,
+  isStepField: boolean
+): Promise<string | null | 'reask'> {
+  const messages = await resolveMessages(phone);
+  const value = field === 'year' ? rawValue.replace(/\D/g, '') : capitalize(rawValue);
+
+  if (field === 'year' && !isPlausibleYear(value)) {
+    if (!isStepField) return null;
+    await sendReply(phone, messages.manual.invalidYear());
+    return 'reask';
+  }
+
+  // Only what's known so far — "Mercedes Benz 2014" has no model yet, and a
+  // literal "null" in the context made the year check reject a valid year.
+  const context = field === 'model' ? details.make ?? undefined
+    : field === 'year' ? [details.make, details.model].filter(Boolean).join(' ') || undefined
+    : undefined;
+  const validationKey = MANUAL_FIELD_VALIDATION_KEY[field];
+  const result = await validateFreeText(validationKey, value, context);
+
+  if (result.valid) {
+    if (isStepField) await clearValidationAttempts(phone, validationKey);
+    return value;
+  }
+  if (!isStepField) return null;
+
+  const attempts = await incrementValidationAttempts(phone, validationKey);
+  if (attempts < MAX_VALIDATION_ATTEMPTS) {
+    const invalidMessage = field === 'make' ? messages.validation.invalidMake()
+      : field === 'model' ? messages.validation.invalidModel()
+      : messages.validation.invalidYear();
+    await sendReply(phone, invalidMessage);
+    return 'reask';
+  }
+  await flagForReview('vehicle', collectionId, field, result.reason || `Failed plausibility check after ${MAX_VALIDATION_ATTEMPTS} attempts: "${value}"`);
+  return value;
+}
+
+/**
+ * Handles a reply at the make / model / year step. The reply is run through
+ * `extractVehicleDetails` first, so a customer who types the whole vehicle at
+ * once ("Toyota Corolla ano 2009 motor 2ZR") has every field filled and the
+ * steps they already answered skipped, instead of the whole sentence being
+ * stored as the make. Only the missing fields are then asked for, in order
+ * ("Mercedes Benz 2014" → only the model is asked; "Hilux 2012" → only the
+ * make). The current step's field takes the extracted value; other fields
+ * are only filled while still empty. If extraction fails or finds nothing
+ * at all, the raw reply is the current step's field, as before.
+ */
+async function processManualVehicleDetails(
+  phone: string,
+  collection: any,
+  reply: string,
+  stepField: ManualVehicleField
+): Promise<boolean> {
+  const messages = await resolveMessages(phone);
+  const extracted = await extractVehicleDetails(reply);
+  const candidates: ManualVehicleDetails = {
+    make: extracted?.make ?? null,
+    model: extracted?.model ?? null,
+    year: extracted?.year ?? null,
+  };
+  // Raw-reply fallback only when nothing was extracted — if other fields
+  // were found ("Hilux 2012" at the make step), keep them and just ask for
+  // the missing one, rather than validating the whole reply as the make.
+  if (!MANUAL_VEHICLE_FIELDS.some((field) => candidates[field])) candidates[stepField] = reply;
+
+  const details: ManualVehicleDetails = {
+    make: collection.make ?? null,
+    model: collection.model ?? null,
+    year: collection.year ?? null,
+  };
+
+  // make → model → year order matters: each one is validated in the context
+  // of the fields before it (a model against its make, a year against both).
+  for (const field of MANUAL_VEHICLE_FIELDS) {
+    const candidate = candidates[field];
+    const isStepField = field === stepField;
+    if (!candidate || (!isStepField && details[field])) continue;
+
+    const value = await validateManualVehicleField(phone, collection.id, field, candidate, details, isStepField);
+    if (value === 'reask') return true;
+    if (value) details[field] = value;
+  }
+
+  const nextStatus = !details.make ? 'awaiting_make'
+    : !details.model ? 'awaiting_model'
+    : !details.year ? 'awaiting_year'
+    : 'awaiting_engine_number';
+  await updateManualCollection(collection.id, { ...details, status: nextStatus });
+
+  const prompt = nextStatus === 'awaiting_make' ? messages.manual.askMakePrompt()
+    : nextStatus === 'awaiting_model' ? messages.manual.askModel(details.make!)
+    : nextStatus === 'awaiting_year' ? messages.manual.askYear(details.make!, details.model!)
+    : messages.manual.askEngineNumber(details.make!, details.model!, details.year!);
+  await sendReply(phone, prompt, { preserve: extractBoldTerms(prompt) });
+  return true;
+}
+
+/**
+ * Advances the manual vehicle-entry step machine (make → model → year →
+ * engine number) based on the collection's current status, skipping any
+ * step the customer already answered, and saves the vehicle and completes
+ * onboarding once all steps are done.
  */
 export async function processManualCollectionStep(
   phone: string,
@@ -380,75 +510,8 @@ export async function processManualCollectionStep(
   const messages = await resolveMessages(phone);
   const r = reply.trim();
 
-  if (collection.status === 'awaiting_make') {
-    const make = capitalize(r);
-    const result = await validateFreeText('vehicleMake', make);
-
-    if (!result.valid) {
-      const attempts = await incrementValidationAttempts(phone, 'vehicleMake');
-      if (attempts < MAX_VALIDATION_ATTEMPTS) {
-        await sendReply(phone, messages.validation.invalidMake());
-        return true;
-      }
-      await flagForReview('vehicle', collection.id, 'make', result.reason || `Failed plausibility check after ${MAX_VALIDATION_ATTEMPTS} attempts: "${make}"`);
-    } else {
-      await clearValidationAttempts(phone, 'vehicleMake');
-    }
-
-    await updateManualCollection(collection.id, { make, status: 'awaiting_model' });
-    const askModel = messages.manual.askModel(make);
-    await sendReply(phone, askModel, { preserve: extractBoldTerms(askModel) });
-    return true;
-  }
-
-  if (collection.status === 'awaiting_model') {
-    const model = capitalize(r);
-    const result = await validateFreeText('vehicleModel', model, collection.make);
-
-    if (!result.valid) {
-      const attempts = await incrementValidationAttempts(phone, 'vehicleModel');
-      if (attempts < MAX_VALIDATION_ATTEMPTS) {
-        await sendReply(phone, messages.validation.invalidModel());
-        return true;
-      }
-      await flagForReview('vehicle', collection.id, 'model', result.reason || `Failed plausibility check after ${MAX_VALIDATION_ATTEMPTS} attempts: "${model}"`);
-    } else {
-      await clearValidationAttempts(phone, 'vehicleModel');
-    }
-
-    await updateManualCollection(collection.id, { model, status: 'awaiting_year' });
-    const askYear = messages.manual.askYear(collection.make, model);
-    await sendReply(phone, askYear, { preserve: extractBoldTerms(askYear) });
-    return true;
-  }
-
-  if (collection.status === 'awaiting_year') {
-    const yearClean = r.replace(/\D/g, '');
-
-    if (!isPlausibleYear(yearClean)) {
-      await sendReply(phone, messages.manual.invalidYear());
-      return true;
-    }
-
-    const vehicleContext = `${collection.make} ${collection.model}`;
-    const result = await validateFreeText('vehicleYear', yearClean, vehicleContext);
-
-    if (!result.valid) {
-      const attempts = await incrementValidationAttempts(phone, 'vehicleYear');
-      if (attempts < MAX_VALIDATION_ATTEMPTS) {
-        await sendReply(phone, messages.validation.invalidYear());
-        return true;
-      }
-      await flagForReview('vehicle', collection.id, 'year', result.reason || `Failed plausibility check after ${MAX_VALIDATION_ATTEMPTS} attempts: "${yearClean}"`);
-    } else {
-      await clearValidationAttempts(phone, 'vehicleYear');
-    }
-
-    await updateManualCollection(collection.id, { year: yearClean, status: 'awaiting_engine_number' });
-    const askEngine = messages.manual.askEngineNumber(collection.make, collection.model, yearClean);
-    await sendReply(phone, askEngine, { preserve: extractBoldTerms(askEngine) });
-    return true;
-  }
+  const stepField = MANUAL_STEP_FIELD[collection.status];
+  if (stepField) return processManualVehicleDetails(phone, collection, r, stepField);
 
   if (collection.status === 'awaiting_engine_number') {
     // Strip straight/curly apostrophes so "don't know" and "dont know" both

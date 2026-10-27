@@ -135,8 +135,8 @@ function detectProseLocale(text: string): 'pt' | 'en' | null {
 // model from adding "mate" / "Ó pá" / "Bem-vindo, meu!". Unicode-aware
 // boundaries, since \b doesn't treat "á"/"ó" as word characters.
 const SLANG_PATTERNS: RegExp[] = [
-  /(?<!\p{L})(mate|buddy|pal|bro|dude|mano|kota|bu[ée]|fixe)(?!\p{L})/iu,
-  /(?<!\p{L})(ó\s*pá|pá)(?!\p{L})/iu,
+  /(?<!\p{L})(mate|buddy|pal|bro|dude|mano|kota|bu[ée]|fixe|cheers|spot\s+on)(?!\p{L})/iu,
+  /(?<!\p{L})(ó\s*pá|pá|pah)(?!\p{L})/iu,
   /(?<!\p{L})meu\s*[!?.,]/iu, // "meu" as a form of address, not "o meu pedido"
   /(?<!\p{L})ó\s+\p{Lu}/u,     // "Ó Dorivaldo!" opening
   // Brazilian Portuguese markers — Angola follows the European-Portuguese norm.

@@ -51,6 +51,9 @@ export const clearPendingOptions = (phone: string): Promise<void> => deleteKey(`
 export interface BasketItemDraft {
   product: Product;
   service: { name: string; price: number } | null;
+  // The search phrase this product was picked from — saved on the order so
+  // an alternatives search re-runs it if admin marks the product unavailable.
+  query?: string;
 }
 
 export interface UnmatchedBasketItem {
@@ -71,6 +74,9 @@ export interface PendingBasket {
   // consolidated notice/waitlist-offer once the whole queue is drained,
   // instead of a repeated back-and-forth per failed item.
   unmatched: UnmatchedBasketItem[];
+  // The phrase whose results list is currently on screen — copied onto the
+  // item the customer picks from it (BasketItemDraft.query).
+  currentQuery?: string;
 }
 
 /**
@@ -179,17 +185,19 @@ export const getOrderProfileStage = (phone: string): Promise<OrderProfileStage |
  */
 export const clearOrderProfileStage = (phone: string): Promise<void> => deleteKey(`orderProfileStage:${phone}`);
 
-// --- Alternatives for unavailable multi-item order lines -------------------
+// --- Alternatives for unavailable order lines -------------------------------
 
 export interface PendingAlternativeOffer {
   orderNumber: string;
-  itemId: number;
+  // The unavailable line item on a multi-item order. Absent for a
+  // single-product order — the order's own product is what gets swapped.
+  itemId?: number;
 }
 
 /**
  * Stores which order/item an alternative-products list currently on screen
  * belongs to, so the customer's list-tap/typed-digit reply resolves back to
- * the right unavailable line item on an existing multi-item order.
+ * the right unavailable product on the existing order instead of starting a new one.
  */
 export const savePendingAlternativeOffer = (phone: string, offer: PendingAlternativeOffer): Promise<void> =>
   setJSON(`altOffer:${phone}`, offer);

@@ -51,6 +51,7 @@ const COURTESY_FILLER_WORDS = new Set([
   'muito', 'muita', 'pela', 'pelo', 'o', 'ajuda', 'apoio', 'atenção', 'atencao', 'tudo', 'bem',
   'está', 'esta', 'de', 'nada', 'então', 'entao', 'sim', 'mesmo', 'assim', 'boa', 'bom', 'até',
   'ate', 'logo', 'mais', 'e', 'por', 'tchau', 'adeus', 'senhor', 'senhora', 'já', 'ja',
+  'suporte', 'parceiro', 'parceira', 'amigo', 'amiga', 'chefe',
 ]);
 
 const COURTESY_MAX_WORDS = 12;

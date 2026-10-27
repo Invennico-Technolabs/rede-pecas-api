@@ -12,7 +12,8 @@ import { getAllAdmins, getAdminByPhone } from '../models/adminUser.model.js';
 import { createAlert } from '../models/alert.model.js';
 import { formatPrice, formatAddressWithMap } from '../utils/helpers.js';
 import { t, getMessages } from '../i18n/messages.js';
-import { resolveMessages, resolveLocale } from './customer.service.js';
+import { resolveMessages, resolveLocale, sendMainMenu } from './customer.service.js';
+import { resetSearchSession } from './session.service.js';
 
 /**
  * Builds the locale-aware catalog of available payment methods (bank
@@ -85,6 +86,36 @@ export async function getPendingPaymentOrder(phone: string) {
     'awaiting_payment_method',
     'awaiting_bank_subtype',
   ]);
+}
+
+/**
+ * Fetches the customer's most recent order whose payment method is chosen
+ * but not yet approved — waiting on the proof upload or on staff verification.
+ */
+export async function getPostPaymentOrder(phone: string) {
+  return getLatestOrderByStatus(phone, [
+    'awaiting_payment_proof',
+    'payment_proof_received',
+    'awaiting_agent_confirmation',
+  ]);
+}
+
+/**
+ * Answers a non-part free-text message sent while an order's payment is
+ * still pending ("já paguei", "quando chega?") with that order's status —
+ * a proof reminder, or "we're verifying" plus the main menu — instead of
+ * letting it fall through to the part-search prompts.
+ */
+export async function sendPostPaymentStatus(phone: string, order: { number: string; status: string }, firstName: string): Promise<void> {
+  const messages = await resolveMessages(phone);
+
+  if (order.status === 'awaiting_payment_proof') {
+    await sendReply(phone, messages.payment.awaitingProofReminder(order.number));
+    return;
+  }
+
+  await sendReply(phone, messages.payment.verifyingPayment(order.number));
+  await sendMainMenu(phone, firstName);
 }
 
 /**
@@ -356,7 +387,8 @@ export async function processAdminPaymentReply(adminPhone: string, buttonReplyId
 
 /**
  * Marks an order approved, generates and sends the final invoice PDF to
- * the customer in their locale, and notifies the supplier to deliver.
+ * the customer in their locale, resets their search session, and notifies
+ * the supplier to deliver.
  */
 export async function approveOrder(orderNumber: string, employeeId: number): Promise<any> {
   const { rows } = await db.query(
@@ -393,6 +425,11 @@ export async function approveOrder(orderNumber: string, employeeId: number): Pro
   const invoicePDF = await generateInvoicePDF(fullOrder, invoiceLineItems, locale);
 
   await sendFinalInvoiceWhatsApp(order.customer_phone, invoicePDF, orderNumber, firstName, locale);
+
+  // The order is done — end the search conversation it came from, so the
+  // customer's next message starts fresh (a greeting gets the main menu)
+  // instead of being read against the old search state.
+  await resetSearchSession(order.customer_phone);
 
   await notifySupplierDelivery(fullOrder);
 

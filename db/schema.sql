@@ -473,7 +473,9 @@ CREATE TABLE IF NOT EXISTS orders (
   -- customer" rather than actionable; goes back to awaiting_stock_confirmation
   -- once a swapped-in alternative needs its own admin confirmation, see
   -- finalizeMultiItemOrder/processAlternativeSelection
-  -- in product.service.ts) | awaiting_payment_method → awaiting_bank_subtype (bank
+  -- in product.service.ts) | awaiting_customer_details (stock confirmed —
+  -- collecting individual/company, address and NIF; the proforma is sent once
+  -- they're in, see orderProfile.service.ts) → awaiting_payment_method → awaiting_bank_subtype (bank
   -- transfer/deposit only — Multicaixa Express and Mobile POS confirm directly,
   -- no subtype step) → awaiting_payment_proof → awaiting_proof_verification
   -- (transient, set for the duration of the Claude Vision validation call in
@@ -536,6 +538,11 @@ CREATE TABLE IF NOT EXISTS orders (
   -- One part-type choice (OEM/Aftermarket/New/Second Hand) per order, asked
   -- once before search and applied to every part in it — not per line item.
   part_type               TEXT,
+  -- The customer's own search phrase for a single-product order (e.g. "brake
+  -- pads") — re-run when admin marks the product unavailable, so the
+  -- alternatives match what they asked for, not the rejected product's
+  -- catalog name. Multi-item orders keep it per line in items[].searchQuery.
+  search_query            TEXT,
   created_at              TIMESTAMPTZ DEFAULT NOW(),
   updated_at              TIMESTAMPTZ DEFAULT NOW()
 );
@@ -552,6 +559,8 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS items JSONB;
 -- One part-type choice (OEM/Aftermarket/New/Second Hand) per order, asked
 -- once before search and applied to every part in it — not per line item.
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS part_type TEXT;
+-- Customer's search phrase, re-used for the alternatives search (see above).
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS search_query TEXT;
 
 -- Retarget orders.product_id's FK from products(id) to product_suppliers(id)
 -- on an existing database — see the column comment above. Guarded so a

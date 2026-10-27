@@ -104,7 +104,7 @@ interface Messages {
     serviceAdded: (serviceName: string, newTotal: string) => string;
     serviceDeclined: () => string;
     confirmingAvailability: () => string;
-    stockConfirmedIntro: (productName: string, customerName: string) => string;
+    stockConfirmedIntro: (productNames: string[], customerName: string) => string;
     stockConfirmationCourtesy: () => string;
     stockUnavailable: (productName: string, reference: string) => string;
     stockUnavailableButtons: [string, string];
@@ -138,8 +138,8 @@ interface Messages {
   };
   /**
    * Individual/company + NIF + address capture, asked once per order right
-   * after the order bucket is confirmed, before stock is checked — replaces
-   * the old onboarding NIF/address registration-time prompts.
+   * after the supplier confirms stock, before the proforma — replaces the
+   * old onboarding NIF/address registration-time prompts.
    */
   orderProfile: {
     askCustomerTypeBody: (name: string) => string;
@@ -160,6 +160,15 @@ interface Messages {
     savedProfileUseButton: () => string;
     savedProfileEditButton: () => string;
     savedProfileNotUnderstood: () => string;
+    // Last-look summary sent once address/NIF are in, right before the proforma.
+    orderReviewSummary: (
+      orderNumber: string,
+      items: { description: string; reference: string; price: string }[],
+      total: string,
+      customerType: 'individual' | 'company',
+      nif: string | null,
+      address: string
+    ) => string;
   };
   payment: {
     methods: {
@@ -174,6 +183,10 @@ interface Messages {
     askBankSubtypeButtons: [string, string];
     proofReceivedCustomer: (customerName: string) => string;
     proofInvalid: () => string;
+    // Free text typed while an order waits on its payment proof / on
+    // verification — answered with the order's status instead of a search.
+    awaitingProofReminder: (orderNumber: string) => string;
+    verifyingPayment: (orderNumber: string) => string;
     supplierDeliveryNotice: (productName: string, reference: string, quantity: number, orderNumber: string) => string;
   };
   pdf: {
@@ -523,14 +536,17 @@ const pt: Messages = {
       `Óptima escolha! 👍\n\n` +
       `Deixa-me só confirmar a disponibilidade com o fornecedor antes de avançarmos.\n\n` +
       `Isto costuma demorar alguns minutos — já volto! ⏳`,
-    stockConfirmedIntro: (productName, customerName) =>
-      `Boas notícias, ${customerName}! ✅\n\n` +
-      `O fornecedor confirmou que *${productName}* está disponível e pronto para ti.\n\n` +
-      `A tua factura proforma segue abaixo. 👇`,
+    stockConfirmedIntro: (productNames, customerName) =>
+      productNames.length === 1
+        ? `Boas notícias, ${customerName}! ✅\n\n` +
+          `O fornecedor confirmou que *${productNames[0]}* está disponível e reservado para ti.`
+        : `Boas notícias, ${customerName}! ✅\n\n` +
+          `O fornecedor confirmou que estas ${productNames.length} peças estão disponíveis e reservadas para ti:\n\n` +
+          productNames.map((name) => `• *${name}*`).join('\n'),
     stockConfirmationCourtesy: () =>
       `Desculpa a demora! 🙏\n\n` +
       `Ainda estamos a confirmar a disponibilidade com o fornecedor.\n` +
-      `A nossa equipa vai responder-te dentro de alguns minutos.\n\n` +
+      `Assim que tivermos confirmação, continuamos aqui mesmo no WhatsApp.\n\n` +
       `Obrigado pela paciência! 😊`,
     stockUnavailable: (productName, reference) =>
       `Desculpa. 😔\n\n` +
@@ -611,7 +627,7 @@ const pt: Messages = {
   },
   orderProfile: {
     askCustomerTypeBody: (name) =>
-      `Boa, ${name}! Só mais uma coisa antes de verificar a disponibilidade.\n\n` +
+      `Antes de te enviar a proforma, ${name}, só preciso de alguns dados para a factura e a entrega.\n\n` +
       `Compras como *particular* ou para uma *empresa*?`,
     askCustomerTypeButtons: ['👤 Particular', '🏢 Empresa'],
     askCompanyNifBody: () =>
@@ -650,6 +666,12 @@ const pt: Messages = {
     savedProfileUseButton: () => '✅ Sim, usar este',
     savedProfileEditButton: () => '✏️ Actualizar dados',
     savedProfileNotUnderstood: () => 'Por favor toca num dos botões acima. 👇',
+    orderReviewSummary: (orderNumber, items, total, customerType, nif, address) =>
+      `📋 *Resumo do pedido — ${orderNumber}*\n\n` +
+      items.map((i) => `• ${i.description}${i.reference && i.reference !== '—' ? ` (Ref ${i.reference})` : ''} — ${i.price}`).join('\n') +
+      `\n*Total: ${total}*\n\n` +
+      `${customerType === 'company' ? '🏢 Empresa' : '👤 Particular'}${nif ? ` · NIF ${nif}` : ''}\n` +
+      `📍 ${address}`,
   },
   /**
    * Payment flow — per-method instructions (bank transfer/deposit,
@@ -719,6 +741,12 @@ const pt: Messages = {
       `⚠️ Não conseguimos confirmar este comprovativo de pagamento.\n\n` +
       `Por favor faz upload de um comprovativo de pagamento válido novamente — foto ou PDF, ` +
       `garantindo que mostra claramente o valor, a data e a referência do pagamento. 📸`,
+    awaitingProofReminder: (orderNumber) =>
+      `O teu pedido *${orderNumber}* está à espera do comprovativo de pagamento. 🧾\n\n` +
+      `Assim que pagares, envia aqui a foto ou o PDF do comprovativo e nós tratamos do resto.`,
+    verifyingPayment: (orderNumber) =>
+      `Estamos a verificar o pagamento do teu pedido *${orderNumber}*. 🔎\n\n` +
+      `Assim que estiver confirmado, envio-te a factura aqui mesmo no WhatsApp.`,
     supplierDeliveryNotice: (productName, reference, quantity, orderNumber) =>
       `📦 *NOVO PEDIDO CONFIRMADO — REDE PEÇAS*\n\n` +
       `Por favor prepare o seguinte artigo para entrega:\n\n` +
@@ -849,7 +877,7 @@ const pt: Messages = {
     unavailableButtonLabel: () => '⚠️ Indisponível',
     reminderBody: (customerName, productName, orderNumber) =>
       `⏰ *LEMBRETE — Cliente à espera*\n\n` +
-      `${customerName} está à espera há 15 minutos pela confirmação de stock de:\n\n` +
+      `${customerName} está à espera há 5 minutos pela confirmação de stock de:\n\n` +
       `${productName} · ${orderNumber}\n\n` +
       `Por favor confirma ou recusa o mais rápido possível na plataforma admin da Rede Peças.`,
     confirmedAck: (orderNumber) => `✅ Confirmado! Factura proforma enviada ao cliente do pedido *${orderNumber}*.`,
@@ -1129,14 +1157,17 @@ const en: Messages = {
       `Great choice! 👍\n\n` +
       `Let me just confirm availability with the supplier before we proceed.\n\n` +
       `This usually takes a few minutes — I'll be right back! ⏳`,
-    stockConfirmedIntro: (productName, customerName) =>
-      `Great news, ${customerName}! ✅\n\n` +
-      `The supplier has confirmed *${productName}* is available and ready for you.\n\n` +
-      `Your proforma invoice is attached below. 👇`,
+    stockConfirmedIntro: (productNames, customerName) =>
+      productNames.length === 1
+        ? `Great news, ${customerName}! ✅\n\n` +
+          `The supplier has confirmed *${productNames[0]}* is available and reserved for you.`
+        : `Great news, ${customerName}! ✅\n\n` +
+          `The supplier has confirmed these ${productNames.length} parts are available and reserved for you:\n\n` +
+          productNames.map((name) => `• *${name}*`).join('\n'),
     stockConfirmationCourtesy: () =>
-      `Sorry for the short wait! 🙏\n\n` +
+      `Sorry for the wait! 🙏\n\n` +
       `We're still confirming availability with the supplier.\n` +
-      `Our team will get back to you within the next few minutes.\n\n` +
+      `As soon as we have confirmation, we'll continue right here on WhatsApp.\n\n` +
       `Thank you for your patience! 😊`,
     stockUnavailable: (productName, reference) =>
       `I'm sorry. 😔\n\n` +
@@ -1217,7 +1248,7 @@ const en: Messages = {
   },
   orderProfile: {
     askCustomerTypeBody: (name) =>
-      `Great, ${name}! One quick thing before I check availability.\n\n` +
+      `Before I send your proforma, ${name}, I just need a few details for the invoice and delivery.\n\n` +
       `Are you buying as an *individual* or for a *company*?`,
     askCustomerTypeButtons: ['👤 Individual', '🏢 Company'],
     askCompanyNifBody: () =>
@@ -1256,6 +1287,12 @@ const en: Messages = {
     savedProfileUseButton: () => '✅ Yes, use this',
     savedProfileEditButton: () => '✏️ Update details',
     savedProfileNotUnderstood: () => 'Please tap one of the buttons above. 👇',
+    orderReviewSummary: (orderNumber, items, total, customerType, nif, address) =>
+      `📋 *Order summary — ${orderNumber}*\n\n` +
+      items.map((i) => `• ${i.description}${i.reference && i.reference !== '—' ? ` (Ref ${i.reference})` : ''} — ${i.price}`).join('\n') +
+      `\n*Total: ${total}*\n\n` +
+      `${customerType === 'company' ? '🏢 Company' : '👤 Individual'}${nif ? ` · NIF ${nif}` : ''}\n` +
+      `📍 ${address}`,
   },
   /**
    * Payment flow — per-method instructions (bank transfer/deposit,
@@ -1325,6 +1362,12 @@ const en: Messages = {
       `⚠️ We weren't able to confirm this payment proof.\n\n` +
       `Please upload a valid payment proof again — photo or PDF, making sure it clearly shows ` +
       `the amount, date, and payment reference. 📸`,
+    awaitingProofReminder: (orderNumber) =>
+      `Your order *${orderNumber}* is waiting for the payment proof. 🧾\n\n` +
+      `Once you've paid, send the photo or PDF of the proof here and we'll take care of the rest.`,
+    verifyingPayment: (orderNumber) =>
+      `We're verifying the payment for your order *${orderNumber}*. 🔎\n\n` +
+      `As soon as it's confirmed, I'll send you the invoice right here on WhatsApp.`,
     supplierDeliveryNotice: (productName, reference, quantity, orderNumber) =>
       `📦 *NEW ORDER CONFIRMED — REDE PEÇAS*\n\n` +
       `Please prepare the following item for delivery:\n\n` +
@@ -1455,7 +1498,7 @@ const en: Messages = {
     unavailableButtonLabel: () => '⚠️ Unavailable',
     reminderBody: (customerName, productName, orderNumber) =>
       `⏰ *REMINDER — Customer is waiting*\n\n` +
-      `${customerName} has been waiting 15 minutes for stock confirmation on:\n\n` +
+      `${customerName} has been waiting 5 minutes for stock confirmation on:\n\n` +
       `${productName} · ${orderNumber}\n\n` +
       `Please confirm or decline ASAP on the Rede Peças admin platform.`,
     confirmedAck: (orderNumber) => `✅ Confirmed! Proforma sent to the customer for order *${orderNumber}*.`,

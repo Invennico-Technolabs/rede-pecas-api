@@ -281,3 +281,60 @@ Respond ONLY with valid JSON, no additional text:
     return null;
   }
 }
+
+export interface ExtractedVehicleDetails {
+  make: string | null;
+  model: string | null;
+  year: string | null;
+}
+
+/**
+ * Pulls the vehicle make, model and year out of a customer's reply during
+ * manual vehicle entry — so "Toyota Corolla ano 2009 motor 2ZR" typed at the
+ * make prompt fills all three fields instead of being stored whole as the
+ * make. Same single-shot shape as `extractProductNames`: no history, JSON
+ * only, and the caller validates every value. Engine codes ("2ZR") are
+ * deliberately not extracted — they aren't the engine number the wizard
+ * asks for. Fails OPEN by returning null on any API/parse error, so the
+ * caller falls back to treating the whole reply as the current step's field.
+ */
+export async function extractVehicleDetails(customerText: string): Promise<ExtractedVehicleDetails | null> {
+  try {
+    const response = await anthropic.messages.create({
+      model: EXTRACTION_MODEL,
+      max_tokens: 150,
+      messages: [{
+        role: "user",
+        content: `A customer is telling an auto-parts store which vehicle they drive, and wrote: "${customerText}"
+
+Extract only what they actually stated:
+- "make": the manufacturer/brand (e.g. "Toyota", "Hyundai"), properly capitalized.
+- "model": the model name without the make (e.g. "Corolla", "Hilux", "i20").
+- "year": the 4-digit manufacturing year (e.g. "2009").
+
+Use null for anything not stated — never guess or infer a missing field. Ignore engine codes,
+engine sizes and filler words ("ano", "motor", "o meu carro é…").
+
+Respond ONLY with valid JSON, no additional text:
+{"make": "..." or null, "model": "..." or null, "year": "..." or null}`,
+      }],
+    });
+
+    const text = response.content[0].type === 'text' ? response.content[0].text.trim() : '';
+
+    try {
+      const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
+      const clean = (value: unknown): string | null => {
+        const s = value == null ? '' : String(value).trim();
+        return s.length ? s : null;
+      };
+      return { make: clean(parsed.make), model: clean(parsed.model), year: clean(parsed.year) };
+    } catch {
+      logger.error(`Error parsing vehicle-extraction model JSON: ${text}`);
+      return null;
+    }
+  } catch (error: any) {
+    logger.error(`Claude vehicle-extraction error: ${error.message}`);
+    return null;
+  }
+}

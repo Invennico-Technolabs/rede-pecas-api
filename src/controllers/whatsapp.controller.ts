@@ -156,6 +156,17 @@ async function processMessageFlow(
 
   const firstName = customer.name?.split(' ')[0] || 'Cliente';
 
+  // The final invoice's "Order status" button belongs to a finished order,
+  // so it's answered whatever the session state — approval resets the
+  // session (resetSearchSession) and a tap hours later finds it expired, and
+  // the fresh-session check below would otherwise turn the tap into the main
+  // menu. Deliberately runs before markSessionActive, so the customer's next
+  // message is still a fresh session (greeting/tap → main menu).
+  if (buttonReplyId?.startsWith('order_status_')) {
+    await orderStatusService.processOrderStatusButton(phone, buttonReplyId);
+    return;
+  }
+
   const freshSession = await sessionService.isNewSession(phone);
   await sessionService.markSessionActive(phone);
 
@@ -172,7 +183,12 @@ async function processMessageFlow(
       await customerService.sendMainMenu(phone, firstName);
       return;
     }
-    await sendReply(phone, messages.onboarding.welcomeBack(firstName), { contextual: true });
+    // A thank-you as the session's first message (typically right after the
+    // final invoice — approval resets the session) gets only the courtesy
+    // reply further down, not a "welcome back" stacked in front of it.
+    if (!customerText || !isCourtesyMessage(customerText)) {
+      await sendReply(phone, messages.onboarding.welcomeBack(firstName), { contextual: true });
+    }
     // A real request as the session's first message (e.g. "engine oil") is
     // processed below instead of being dropped — the vehicle question comes
     // from the search fallback. Media (e.g. a payment proof) falls through as before.
@@ -225,11 +241,6 @@ async function processMessageFlow(
     const stage = await sessionService.getOrderProfileStage(phone);
     if (stage && await orderProfileService.processOrderProfileLocation(phone, location, stage)) return;
     await sendReply(phone, messages.common.locationNotNeeded());
-    return;
-  }
-
-  if (buttonReplyId?.startsWith('order_status_')) {
-    await orderStatusService.processOrderStatusButton(phone, buttonReplyId);
     return;
   }
 
@@ -412,6 +423,30 @@ async function processMessageFlow(
     return;
   }
 
+  // Payment chosen/sent but not yet approved: free text is almost always
+  // about that payment ("já paguei", "quando chega?"), so a message that
+  // isn't a part request gets the order's status instead of the part-search
+  // prompts. A real part request still goes on to a normal search, reusing
+  // this extraction. Taps, handoff, courtesy and status keywords keep their
+  // own handling below.
+  let extractedProductNames: string[] | null | undefined;
+  if (
+    mediaType !== 'interactive' &&
+    !HUMAN_HANDOFF_PATTERN.test(customerText) &&
+    !isCourtesyMessage(customerText) &&
+    !ORDER_STATUS_PATTERN.test(customerText.trim())
+  ) {
+    const postPaymentOrder = await paymentService.getPostPaymentOrder(phone);
+    if (postPaymentOrder) {
+      extractedProductNames = isBareReply(customerText) ? [] : await extractProductNames(customerText);
+      if (extractedProductNames && extractedProductNames.length === 0) {
+        logger.info(`[FLOW] ${phone} sent "${customerText}" while order ${postPaymentOrder.number} is ${postPaymentOrder.status} — sending its status.`);
+        await paymentService.sendPostPaymentStatus(phone, postPaymentOrder, firstName);
+        return;
+      }
+    }
+  }
+
   const invitedToAskForPart = await sessionService.wasPartPromptSent(phone);
   if (!invitedToAskForPart && mediaType !== 'interactive') {
     const asked = await vehicleService.sendAskPartPrompt(phone);
@@ -482,7 +517,9 @@ async function processMessageFlow(
   // the message isn't asking for a part (a question, a name/NIF/address,
   // small talk). Neither ever starts a search. null = extraction failed →
   // fail open and search the raw text, so an API outage never blocks a request.
-  const productNames = isBareReply(customerText) ? [] : await extractProductNames(customerText);
+  const productNames = extractedProductNames !== undefined
+    ? extractedProductNames
+    : isBareReply(customerText) ? [] : await extractProductNames(customerText);
   if (productNames && productNames.length === 0) {
     logger.info(`[PRODUCT SEARCH] ${phone} message isn't a part request ("${customerText}") — not searching.`);
     const notAPartRequest = messages.agent.notAPartRequest();
