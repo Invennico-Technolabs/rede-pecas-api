@@ -23,6 +23,27 @@ export interface VisionData {
   body_type?: string | null;
 }
 
+const VISION_TEXT_FIELDS = [
+  'reason', 'make', 'model', 'year', 'license_plate', 'chassis_number',
+  'engine_number', 'engine_size', 'fuel_type', 'color', 'body_type',
+] as const;
+
+/**
+ * Coerces the model's parsed JSON into the declared VisionData shape. The
+ * model doesn't reliably honour the prompt's string types — e.g. it returns
+ * `"year": 2014` as a number, which crashed isPlausibleYear's `.replace()`
+ * and aborted the whole webhook turn — so every text field becomes a trimmed
+ * string, or null when missing/empty.
+ */
+function normalizeVisionData(parsed: Record<string, unknown>): VisionData {
+  const data: VisionData = { document: true, valid: parsed.valid === true };
+  for (const field of VISION_TEXT_FIELDS) {
+    const value = parsed[field];
+    data[field] = value === null || value === undefined || String(value).trim() === '' ? null : String(value).trim();
+  }
+  return data;
+}
+
 /**
  * Sends a vehicle document/VIN photo to Claude Vision and parses back the
  * extracted vehicle fields (make, model, chassis number, etc), returning null
@@ -78,6 +99,17 @@ with valid JSON:
   "owner": null
 }
 
+ANGOLAN LIVRETE (Viação e Trânsito) — map its printed labels to the JSON fields like this:
+- "Marca" -> make (e.g. KIA, MITSUBISHI)
+- "Modelo" -> model: the model NAME only, without trim/engine/year suffixes
+  (e.g. "L200-4X4-2,50-2014" -> "L200", "SPORTAGE 2.0 CRDI" -> "SPORTAGE")
+- "Nº do Quadro" -> chassis_number (this IS the VIN)
+- "Nº do Motor" -> engine_number
+- "Matrícula" -> license_plate
+- "Cilindrada" -> engine_size in litres (e.g. "2477 c.c." -> "2.5")
+- "Combustível" -> fuel_type ("Gasóleo" = Diesel, "Gasolina" = Gasoline)
+- year -> the model year if printed; otherwise the year of "Data do Primeiro Registo"
+
 IMPORTANT RULES:
 - A photo that clearly shows a 17-character chassis number (VIN) is always valid (valid: true), even if
   no other field is visible — make/model/year can be null, the VIN alone is enough
@@ -102,7 +134,7 @@ IMPORTANT RULES:
     try {
       const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
       if (!parsed.document) return null;
-      return parsed as VisionData;
+      return normalizeVisionData(parsed);
     } catch {
       logger.error(`Error parsing vision model JSON: ${text}`);
       return { valid: false, reason: "Erro ao interpretar o documento." } as VisionData;
@@ -198,10 +230,12 @@ IMPORTANT RULES:
  * codebase's "no conversational AI in the message pipeline" rule alongside
  * `validation.service.ts`'s `validateFreeText` (see CLAUDE.md): a single-shot
  * judgment call, no history, no system prompt, no JSON action dispatch.
- * Fails OPEN by returning null on any network/API error or unparseable
- * response, so the caller falls back to treating the whole message as one
- * single-product search — today's unchanged behavior — rather than ever
- * blocking a search on an Anthropic outage.
+ * Returns an EMPTY array when the message isn't a part request at all
+ * (greeting, yes/no, a delivery question, a name/NIF/address typed after its
+ * prompt expired…) — the caller must not search then. Fails OPEN by
+ * returning null on any network/API error or unparseable response, so the
+ * caller falls back to treating the whole message as one single-product
+ * search rather than ever blocking a search on an Anthropic outage.
  */
 export async function extractProductNames(customerText: string): Promise<string[] | null> {
   try {
@@ -210,14 +244,17 @@ export async function extractProductNames(customerText: string): Promise<string[
       max_tokens: 300,
       messages: [{
         role: "user",
-        content: `A customer sent this WhatsApp message to an auto-parts store, asking for one or more
-parts: "${customerText}"
+        content: `A customer sent this WhatsApp message to an auto-parts store: "${customerText}"
 
 Identify each DISTINCT part/product they're asking for, as a short search phrase suitable for a
 parts-catalog full-text search (e.g. "filtro de óleo", "pastilhas de travão dianteiras") — not a
 rewrite of the whole message, not synonyms, no invented parts they didn't mention. If the message
-names only one product (or nothing clearly product-like), respond with an array containing just
-that one phrase (or the original message text verbatim if nothing product-like is identifiable).
+names only one product, respond with an array containing just that one phrase. A bare part name,
+part reference/code (e.g. "W712/75", "90915-YZZD2") or brand+part counts as a request.
+
+If the message is NOT asking for a part or product — e.g. a greeting, thanks, a yes/no answer, a
+question about delivery, payment, prices in general, opening hours or an order, a person's name,
+an address, a tax number (NIF), or small talk — respond with an EMPTY array: {"products": []}.
 
 Respond ONLY with valid JSON, no additional text:
 {"products": ["phrase1", "phrase2", ...]}`,
@@ -228,16 +265,76 @@ Respond ONLY with valid JSON, no additional text:
 
     try {
       const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
-      const products = Array.isArray(parsed.products)
-        ? parsed.products.map((p: any) => String(p).trim()).filter((p: string) => p.length > 0)
-        : [];
-      return products.length > 0 ? products : [customerText];
+      if (!Array.isArray(parsed.products)) {
+        logger.error(`Product-extraction JSON has no products array: ${text}`);
+        return null;
+      }
+      // [] is a real answer — "this message isn't a part request" — and the
+      // caller must NOT search on it.
+      return parsed.products.map((p: any) => String(p).trim()).filter((p: string) => p.length > 0);
     } catch {
       logger.error(`Error parsing product-extraction model JSON: ${text}`);
       return null;
     }
   } catch (error: any) {
     logger.error(`Claude product-extraction error: ${error.message}`);
+    return null;
+  }
+}
+
+export interface ExtractedVehicleDetails {
+  make: string | null;
+  model: string | null;
+  year: string | null;
+}
+
+/**
+ * Pulls the vehicle make, model and year out of a customer's reply during
+ * manual vehicle entry — so "Toyota Corolla ano 2009 motor 2ZR" typed at the
+ * make prompt fills all three fields instead of being stored whole as the
+ * make. Same single-shot shape as `extractProductNames`: no history, JSON
+ * only, and the caller validates every value. Engine codes ("2ZR") are
+ * deliberately not extracted — they aren't the engine number the wizard
+ * asks for. Fails OPEN by returning null on any API/parse error, so the
+ * caller falls back to treating the whole reply as the current step's field.
+ */
+export async function extractVehicleDetails(customerText: string): Promise<ExtractedVehicleDetails | null> {
+  try {
+    const response = await anthropic.messages.create({
+      model: EXTRACTION_MODEL,
+      max_tokens: 150,
+      messages: [{
+        role: "user",
+        content: `A customer is telling an auto-parts store which vehicle they drive, and wrote: "${customerText}"
+
+Extract only what they actually stated:
+- "make": the manufacturer/brand (e.g. "Toyota", "Hyundai"), properly capitalized.
+- "model": the model name without the make (e.g. "Corolla", "Hilux", "i20").
+- "year": the 4-digit manufacturing year (e.g. "2009").
+
+Use null for anything not stated — never guess or infer a missing field. Ignore engine codes,
+engine sizes and filler words ("ano", "motor", "o meu carro é…").
+
+Respond ONLY with valid JSON, no additional text:
+{"make": "..." or null, "model": "..." or null, "year": "..." or null}`,
+      }],
+    });
+
+    const text = response.content[0].type === 'text' ? response.content[0].text.trim() : '';
+
+    try {
+      const parsed = JSON.parse(text.replace(/```json|```/g, "").trim());
+      const clean = (value: unknown): string | null => {
+        const s = value == null ? '' : String(value).trim();
+        return s.length ? s : null;
+      };
+      return { make: clean(parsed.make), model: clean(parsed.model), year: clean(parsed.year) };
+    } catch {
+      logger.error(`Error parsing vehicle-extraction model JSON: ${text}`);
+      return null;
+    }
+  } catch (error: any) {
+    logger.error(`Claude vehicle-extraction error: ${error.message}`);
     return null;
   }
 }

@@ -1,9 +1,12 @@
 import { getCustomerByPhone, updateCustomer } from '../models/customer.model.js';
-import { sendReply, sendReplyButtons } from './reply.service.js';
+import { getLatestOrderByStatus, updateOrderStatus } from '../models/order.model.js';
+import { logger } from '../config/logger.js';
+import { sendReply, sendReplyButtons, sendReplyLocationRequest } from './reply.service.js';
 import { extractBoldTerms } from './humanize.service.js';
 import { resolveMessages } from './customer.service.js';
-import { requestStockConfirmation } from './product.service.js';
+import { sendProformaAndAskPayment } from './product.service.js';
 import {
+  markSessionActive,
   savePendingOrderProfileShortcut,
   clearPendingOrderProfileShortcut,
   saveOrderProfileStage,
@@ -17,11 +20,17 @@ import { isPlausibleNif, validateFreeText, flagForReview, MAX_VALIDATION_ATTEMPT
 
 /**
  * Kicks off (or shortcuts) the individual/company + NIF + address capture
- * for a just-confirmed order, right before stock is checked with suppliers
- * — see CLAUDE.md's message pipeline for where this replaces the old
- * registration-time NIF/address stages.
+ * for an order whose stock the supplier has just confirmed — the proforma
+ * and payment follow once it completes. See CLAUDE.md's message pipeline for
+ * where this replaces the old registration-time NIF/address stages.
  */
 export async function startOrderProfileCapture(phone: string, orderNumber: string): Promise<void> {
+  await updateOrderStatus(orderNumber, 'awaiting_customer_details');
+  // Admin can confirm stock hours after the customer's last message — keep
+  // the session alive so their tap on the prompt below isn't taken as a
+  // fresh-session opener (which answers with the main menu instead).
+  await markSessionActive(phone);
+
   const messages = await resolveMessages(phone);
   const customer = await getCustomerByPhone(phone);
   const firstName = customer?.name?.split(' ')[0] || 'Cliente';
@@ -53,7 +62,7 @@ export async function startOrderProfileCapture(phone: string, orderNumber: strin
 
 /**
  * Handles the customer's reply to the saved-profile shortcut: "use saved"
- * proceeds straight to stock confirmation, "edit" drops into the fresh
+ * proceeds straight to the proforma and payment, "edit" drops into the fresh
  * wizard (overwriting the saved profile), anything else re-sends the
  * identical prompt rather than guessing.
  */
@@ -64,7 +73,7 @@ export async function processProfileShortcutReply(
 ): Promise<boolean> {
   if (buttonReplyId === 'order_profile_use_saved') {
     await clearPendingOrderProfileShortcut(phone);
-    await requestStockConfirmation(phone, pending.orderNumber);
+    await sendProformaAndAskPayment(phone, pending.orderNumber);
     return true;
   }
 
@@ -96,18 +105,118 @@ export async function processProfileShortcutReply(
 /**
  * Commits the captured customer_type/nif/address to the customer's profile
  * (last-known values, reused as the saved-profile shortcut on future orders)
- * and proceeds to stock confirmation for this order.
+ * and proceeds to the proforma and payment for this order.
  */
 async function finalizeOrderProfile(
   phone: string,
   orderNumber: string,
   customerType: 'individual' | 'company',
   nif: string | null,
-  address: string | null
+  address: string | null,
+  coords: { lat: number | null; lng: number | null } = { lat: null, lng: null }
 ): Promise<void> {
+  // Save first, clear the wizard after: if the DB write throws, the stage
+  // survives and the customer's retry still lands in the wizard, instead of
+  // the order being stranded at awaiting_customer_details with its state gone.
+  await updateCustomer(phone, { customer_type: customerType, nif, address, address_lat: coords.lat, address_lng: coords.lng });
   await clearOrderProfileStage(phone);
-  await updateCustomer(phone, { customer_type: customerType, nif, address });
-  await requestStockConfirmation(phone, orderNumber);
+  await sendProformaAndAskPayment(phone, orderNumber);
+}
+
+// How far back an unfinished order may be resumed — the session TTL, so a
+// days-old abandoned order is never dragged back into the conversation.
+const RESUMABLE_ORDER_MAX_AGE_MS = 4 * 60 * 60 * 1000;
+
+/**
+ * Restarts the profile capture (individual/company + NIF + address) for the
+ * customer's latest order still at `awaiting_customer_details` — stock
+ * confirmed, but the proforma never sent — when its wizard state was lost
+ * (session expiry, restart, a failed step). Returns false when there's no
+ * such recent order.
+ */
+export async function resumeOrderProfileCapture(phone: string): Promise<boolean> {
+  const order = await getLatestOrderByStatus(phone, ['awaiting_customer_details']);
+  if (!order || Date.now() - new Date(order.created_at).getTime() > RESUMABLE_ORDER_MAX_AGE_MS) return false;
+  logger.info(`[ORDER PROFILE] ${phone} resuming lost profile capture for order ${order.number}`);
+  await startOrderProfileCapture(phone, order.number);
+  return true;
+}
+
+/**
+ * Asks for the delivery address as WhatsApp's native location request —
+ * "📍 Send location" is the primary path, a typed address still works.
+ */
+async function askDeliveryAddress(phone: string, body: string): Promise<void> {
+  await sendReplyLocationRequest(phone, body, { preserve: extractBoldTerms(body) });
+}
+
+const ADDRESS_STAGES: OrderProfileStage['stage'][] = ['awaiting_individual_address', 'awaiting_company_address'];
+
+export interface SharedLocation {
+  latitude: number;
+  longitude: number;
+  name?: string | null;
+  address?: string | null;
+}
+
+/**
+ * Moves the wizard past the address step once a readable address is in hand
+ * (typed, a named WhatsApp place, or pin + landmark): company orders already
+ * have their NIF and finalize; individual orders go on to the optional NIF
+ * question, carrying the address and any coordinates in the stage.
+ */
+async function continueAfterLocationAddress(
+  phone: string,
+  stage: OrderProfileStage,
+  address: string,
+  coords: { lat: number | null; lng: number | null }
+): Promise<void> {
+  if (stage.customerType === 'company') {
+    await finalizeOrderProfile(phone, stage.orderNumber, 'company', stage.nif ?? null, address, coords);
+    return;
+  }
+  const messages = await resolveMessages(phone);
+  await saveOrderProfileStage(phone, {
+    ...stage,
+    stage: 'awaiting_individual_nif_choice',
+    address,
+    addressLat: coords.lat,
+    addressLng: coords.lng,
+  });
+  await sendReplyButtons(phone, messages.orderProfile.askIndividualNifBody(), messages.orderProfile.askIndividualNifButtons, ['order_nif_yes', 'order_nif_no']);
+}
+
+/**
+ * Handles a shared WhatsApp location while the wizard is waiting for the
+ * delivery address. When WhatsApp attached a place name/address (the
+ * customer picked a named place), that's already readable — save it with the
+ * coordinates and move on. A bare "current location" pin has no text at all,
+ * so only then ask for one landmark (stage awaiting_address_landmark), since
+ * coordinates alone can't be read by staff or a courier. Returns false when
+ * the wizard isn't at an address step.
+ */
+export async function processOrderProfileLocation(phone: string, location: SharedLocation, stage: OrderProfileStage): Promise<boolean> {
+  if (!ADDRESS_STAGES.includes(stage.stage)) return false;
+
+  const messages = await resolveMessages(phone);
+  const place = [location.name, location.address].map((s) => s?.trim()).filter(Boolean).join(', ') || null;
+  await clearValidationAttempts(phone, 'address');
+
+  if (place) {
+    await continueAfterLocationAddress(phone, stage, place, { lat: location.latitude, lng: location.longitude });
+    return true;
+  }
+
+  await saveOrderProfileStage(phone, {
+    ...stage,
+    stage: 'awaiting_address_landmark',
+    addressLat: location.latitude,
+    addressLng: location.longitude,
+    addressPlace: place,
+  });
+  const askLandmark = messages.orderProfile.askAddressLandmark();
+  await sendReply(phone, askLandmark, { preserve: extractBoldTerms(askLandmark) });
+  return true;
 }
 
 const NIF_YES_PATTERN = /\b(sim|yes)\b|✅|^s$|^y$|^1$/i;
@@ -118,7 +227,7 @@ const NIF_NO_PATTERN = /\b(n[ãa]o|no|nope)\b|❌|^n$|^2$/i;
  * step, branching by path: company asks NIF first (required, validated,
  * re-asked on failure) then address; individual asks address first, then an
  * optional NIF yes/no, then the NIF number only if yes. The final step of
- * either path commits the profile and moves on to stock confirmation.
+ * either path commits the profile and moves on to the proforma and payment.
  */
 export async function processOrderProfileStep(
   phone: string,
@@ -134,8 +243,7 @@ export async function processOrderProfileStep(
       const customer = await getCustomerByPhone(phone);
       const firstName = customer?.name?.split(' ')[0] || 'Cliente';
       await saveOrderProfileStage(phone, { ...stage, stage: 'awaiting_individual_address', customerType: 'individual' });
-      const askIndividualAddress = messages.orderProfile.askIndividualAddressBody(firstName);
-      await sendReply(phone, askIndividualAddress, { preserve: extractBoldTerms(askIndividualAddress) });
+      await askDeliveryAddress(phone, messages.orderProfile.askIndividualAddressBody(firstName));
       return true;
     }
     if (buttonReplyId === 'customer_type_company') {
@@ -164,8 +272,15 @@ export async function processOrderProfileStep(
     const customer = await getCustomerByPhone(phone);
     const firstName = customer?.name?.split(' ')[0] || 'Cliente';
     await saveOrderProfileStage(phone, { ...stage, stage: 'awaiting_company_address', nif });
-    const askCompanyAddress = messages.orderProfile.askCompanyAddressBody(firstName);
-    await sendReply(phone, askCompanyAddress, { preserve: extractBoldTerms(askCompanyAddress) });
+    await askDeliveryAddress(phone, messages.orderProfile.askCompanyAddressBody(firstName));
+    return true;
+  }
+
+  if (stage.stage === 'awaiting_address_landmark') {
+    // Any non-empty text is accepted as the landmark — it's a courier hint,
+    // not a field with a checkable format. Readable address = place + landmark.
+    const address = [stage.addressPlace, `${messages.orderProfile.landmarkLabel()} ${r}`].filter(Boolean).join(' · ');
+    await continueAfterLocationAddress(phone, stage, address, stageCoords(stage));
     return true;
   }
 
@@ -174,7 +289,7 @@ export async function processOrderProfileStep(
     if (!result.valid) {
       const attempts = await incrementValidationAttempts(phone, 'address');
       if (attempts < MAX_VALIDATION_ATTEMPTS) {
-        await sendReply(phone, messages.validation.invalidAddress());
+        await askDeliveryAddress(phone, messages.validation.invalidAddress());
         return true;
       }
       await flagForReview('customer', phone, 'address', result.reason || `Failed plausibility check after ${MAX_VALIDATION_ATTEMPTS} attempts: "${r}"`);
@@ -191,7 +306,7 @@ export async function processOrderProfileStep(
     if (!result.valid) {
       const attempts = await incrementValidationAttempts(phone, 'address');
       if (attempts < MAX_VALIDATION_ATTEMPTS) {
-        await sendReply(phone, messages.validation.invalidAddress());
+        await askDeliveryAddress(phone, messages.validation.invalidAddress());
         return true;
       }
       await flagForReview('customer', phone, 'address', result.reason || `Failed plausibility check after ${MAX_VALIDATION_ATTEMPTS} attempts: "${r}"`);
@@ -209,7 +324,7 @@ export async function processOrderProfileStep(
     const yesNif = buttonReplyId === 'order_nif_yes' || NIF_YES_PATTERN.test(r);
 
     if (noNif) {
-      await finalizeOrderProfile(phone, stage.orderNumber, 'individual', null, stage.address ?? null);
+      await finalizeOrderProfile(phone, stage.orderNumber, 'individual', null, stage.address ?? null, stageCoords(stage));
       return true;
     }
     if (yesNif) {
@@ -235,9 +350,16 @@ export async function processOrderProfileStep(
       await clearValidationAttempts(phone, 'nif');
     }
 
-    await finalizeOrderProfile(phone, stage.orderNumber, 'individual', nif, stage.address ?? null);
+    await finalizeOrderProfile(phone, stage.orderNumber, 'individual', nif, stage.address ?? null, stageCoords(stage));
     return true;
   }
 
   return false;
+}
+
+/**
+ * The wizard's shared-location coordinates, or nulls for a typed address.
+ */
+function stageCoords(stage: OrderProfileStage): { lat: number | null; lng: number | null } {
+  return { lat: stage.addressLat ?? null, lng: stage.addressLng ?? null };
 }

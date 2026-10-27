@@ -70,6 +70,83 @@ export async function sendWhatsAppMessage(phone: string, text: string): Promise<
 }
 
 /**
+ * Sends WhatsApp's native location-request message: the body plus a
+ * "Send location" button (label rendered by the WhatsApp client in the
+ * customer's app language). The reply arrives as a `location` message.
+ */
+export async function sendWhatsAppLocationRequest(phone: string, body: string): Promise<any> {
+  logger.debug(`[TEST-CAPTURE] location-request -> ${phone}: ${body}`);
+  await appendChatMessage(phone, 'out', body);
+  try {
+    const response = await fetch(WHATSAPP_API_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${config.whatsapp.token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        recipient_type: "individual",
+        to: phone,
+        type: "interactive",
+        interactive: {
+          type: "location_request_message",
+          body: { text: clampBody(body, 'Location request') },
+          action: { name: "send_location" },
+        },
+      }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      logger.error('WhatsApp API sending error', error);
+      throw new Error(`WhatsApp API error: ${response.status}`);
+    }
+
+    return response.json();
+  } catch (error: any) {
+    logger.error(`Error sending location request to ${phone}: ${error.message}`);
+    throw error;
+  }
+}
+
+/**
+ * Sends an image message by an existing WhatsApp media id (e.g. one a
+ * customer just sent — Meta lets the same id be re-sent, no re-upload), with
+ * a caption truncated to WhatsApp's 1024-character limit.
+ */
+export async function sendWhatsAppImage(phone: string, mediaId: string, caption: string): Promise<any> {
+  logger.debug(`[TEST-CAPTURE] image -> ${phone}: ${caption}`);
+  await appendChatMessage(phone, 'out', `[image] ${caption}`);
+  try {
+    const response = await fetch(WHATSAPP_API_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${config.whatsapp.token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        to: phone,
+        type: "image",
+        image: { id: mediaId, caption: clampBody(caption, 'Image caption') },
+      }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      logger.error('WhatsApp API sending error', error);
+      throw new Error(`WhatsApp API error: ${response.status}`);
+    }
+
+    return response.json();
+  } catch (error: any) {
+    logger.error(`Error sending image to ${phone}: ${error.message}`);
+    throw error;
+  }
+}
+
+/**
  * Marks an inbound WhatsApp message as read and shows the typing
  * indicator to the customer while a reply is being prepared.
  */

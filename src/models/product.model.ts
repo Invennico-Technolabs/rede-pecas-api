@@ -50,7 +50,19 @@ export interface Product {
   vehicle_fits?: VehicleFit[];
 }
 
+// Matches a product containing ANY of the query's lexemes — only safe when
+// paired with another narrowing filter (the alternative-search flows pass a
+// subcategory), since a single common word like "engine" or "front" is
+// otherwise enough to surface a completely unrelated part.
 const OR_TSQUERY = `to_tsquery('english', array_to_string(tsvector_to_array(to_tsvector('english', unaccent($1))), ' | '))`;
+
+// Matches a product containing ALL of the query's lexemes — the default for
+// a customer's own search phrase, so "engine oil" can't match a timing belt
+// just because its keywords mention "engine". plainto_tsquery also ignores
+// tsquery operator characters, so references like "W712/75" are safe here.
+const AND_TSQUERY = `plainto_tsquery('english', unaccent($1))`;
+
+export type SearchMatchMode = 'all' | 'any';
 
 const SEARCH_CANDIDATE_LIMIT = 50;
 
@@ -122,6 +134,7 @@ export async function searchProductsInInventory({
   excludeProductIds,
   subcategory,
   productType,
+  matchMode = 'all',
 }: {
   part: string;
   vehicle?: SearchVehicle | null;
@@ -130,11 +143,14 @@ export async function searchProductsInInventory({
   // a known-good reference item — used by the "find an alternative for this
   // rejected/out-of-stock item" flows, where searching on the rejected
   // product's full display name alone (e.g. "Front Brake Pads Aftermarket
-  // ESD7052") under this app's OR-joined full-text query can match on just
-  // one common word like "front" and surface a completely unrelated part.
-  // The plain customer free-text search (searchAndRespond) never sets this
-  // — a customer's own short query doesn't have this failure mode.
+  // ESD7052") under matchMode 'any' can match on just one common word like
+  // "front" and surface a completely unrelated part.
   subcategory?: string | null;
+  // 'all' (default): every query word must match — a customer's own search
+  // phrase. 'any': at least one word must match — only for the alternative
+  // flows above, where the query is a full product display name (brand +
+  // reference included) that no *other* product would match on every word.
+  matchMode?: SearchMatchMode;
   // The customer's order-wide part-type choice (OEM/Aftermarket/New/Second
   // Hand — see the part-type selection step). Soft filter: a row with
   // product_type IS NULL (every pre-existing catalog row, until re-imported
@@ -172,7 +188,7 @@ export async function searchProductsInInventory({
       ps.quantity > 0
       AND ps.active = true
       AND p.active = true
-      AND p.search_vector @@ ${OR_TSQUERY}
+      AND p.search_vector @@ ${matchMode === 'any' ? OR_TSQUERY : AND_TSQUERY}
       AND ($2::int[] IS NULL OR NOT (ps.id = ANY($2::int[])))
       AND ($3::text IS NULL OR p.subcategory = $3)
       AND ($4::text IS NULL OR p.product_type IS NULL OR p.product_type = $4)
@@ -189,7 +205,7 @@ export async function searchProductsInInventory({
     : rows;
 
   const results = compatible.slice(0, 3).map(({ vehicle_fits, ...p }: any) => p as Product);
-  logger.debug(`[PRODUCT SEARCH] query="${part}" vehicle=${vehicle ? `${vehicle.make} ${vehicle.model} ${vehicle.year}` : 'none'} candidates=${rows.length} compatible=${compatible.length} returned=${results.length}`);
+  logger.debug(`[PRODUCT SEARCH] query="${part}" match=${matchMode} vehicle=${vehicle ? `${vehicle.make} ${vehicle.model} ${vehicle.year}` : 'none'} candidates=${rows.length} compatible=${compatible.length} returned=${results.length}`);
   return results;
 }
 
@@ -410,8 +426,9 @@ export async function hardDeleteProduct(id: number): Promise<HardDeleteResult> {
 
 /**
  * Full-text searches for an active, out-of-stock (quantity = 0) offer
- * matching `part`, used to check whether a "no stock" search should offer a
- * restock waitlist instead of nothing.
+ * matching every word of `part`, used to check whether a "no stock" search
+ * should offer a restock waitlist instead of nothing. Always all-words
+ * matching — only the customer's own search phrase reaches this.
  */
 export async function findZeroQuantityProductMatch({
   part,
@@ -429,7 +446,7 @@ export async function findZeroQuantityProductMatch({
      WHERE ps.quantity = 0
        AND ps.active = true
        AND p.active = true
-       AND p.search_vector @@ ${OR_TSQUERY}
+       AND p.search_vector @@ ${AND_TSQUERY}
        AND ($2::text IS NULL OR p.product_type IS NULL OR p.product_type = $2)
      ORDER BY ps.updated_at DESC
      LIMIT 1`,

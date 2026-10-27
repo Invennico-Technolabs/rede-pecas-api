@@ -1,6 +1,6 @@
 import { resolveLocale } from './customer.service.js';
 import { humanize, HumanizeOptions, INTERACTIVE_BODY_LIMIT, TEXT_BODY_LIMIT } from './humanize.service.js';
-import { sendWhatsAppMessage, sendWhatsAppButtons, sendWhatsAppList } from './whatsapp.service.js';
+import { sendWhatsAppMessage, sendWhatsAppButtons, sendWhatsAppList, sendWhatsAppLocationRequest } from './whatsapp.service.js';
 import { saveActivePromptId } from './session.service.js';
 
 
@@ -50,6 +50,15 @@ export async function sendReplyButtons(
   const res = await sendWhatsAppButtons(phone, await rewrite(phone, body, INTERACTIVE_BODY_LIMIT, opts), buttons, ids, media);
   await saveActivePromptId(phone, res?.messages?.[0]?.id);
   return res;
+}
+
+/**
+ * Sends WhatsApp's native "Send location" request to a customer, humanizing
+ * the body first. Not tracked as the active prompt: the reply is a
+ * `location` message, which the stale-tap check never applies to.
+ */
+export async function sendReplyLocationRequest(phone: string, body: string, opts?: ReplyOptions): Promise<any> {
+  return sendWhatsAppLocationRequest(phone, await rewrite(phone, body, INTERACTIVE_BODY_LIMIT, opts));
 }
 
 /**

@@ -17,6 +17,12 @@ export interface Customer {
   active: boolean;
   needs_review: boolean;
   needs_review_reason: string | null;
+  // Conversation language — only ever set by the customer's explicit choice.
+  locale: 'pt' | 'en' | null;
+  // Delivery point from a shared WhatsApp location; NULL for a typed address.
+  // pg returns NUMERIC as a string.
+  address_lat: string | number | null;
+  address_lng: string | number | null;
 }
 
 /**

@@ -473,7 +473,9 @@ CREATE TABLE IF NOT EXISTS orders (
   -- customer" rather than actionable; goes back to awaiting_stock_confirmation
   -- once a swapped-in alternative needs its own admin confirmation, see
   -- finalizeMultiItemOrder/processAlternativeSelection
-  -- in product.service.ts) | awaiting_payment_method → awaiting_bank_subtype (bank
+  -- in product.service.ts) | awaiting_customer_details (stock confirmed —
+  -- collecting individual/company, address and NIF; the proforma is sent once
+  -- they're in, see orderProfile.service.ts) → awaiting_payment_method → awaiting_bank_subtype (bank
   -- transfer/deposit only — Multicaixa Express and Mobile POS confirm directly,
   -- no subtype step) → awaiting_payment_proof → awaiting_proof_verification
   -- (transient, set for the duration of the Claude Vision validation call in
@@ -510,6 +512,11 @@ CREATE TABLE IF NOT EXISTS orders (
   -- Set once the 15-minute admin-reminder WhatsApp nudge has gone out for this
   -- order, so the sweep in product.service.ts never resends it.
   stock_confirmation_admin_reminder_sent BOOLEAN DEFAULT false,
+  -- When the order last entered awaiting_stock_confirmation (set by
+  -- updateOrderStatus). Both sweeps above measure their 20/15-minute wait
+  -- from here — created_at predates the per-order NIF/address step, so it
+  -- made the courtesy fire right after the "let me check" message.
+  stock_confirmation_requested_at TIMESTAMPTZ,
   -- Purely an admin-panel display concern — hides an approved order from the
   -- admin grid (DELETE /admin/orders/:number, only ever allowed on an already-
   -- 'approved' order) without touching status, the customer's order, or
@@ -531,6 +538,11 @@ CREATE TABLE IF NOT EXISTS orders (
   -- One part-type choice (OEM/Aftermarket/New/Second Hand) per order, asked
   -- once before search and applied to every part in it — not per line item.
   part_type               TEXT,
+  -- The customer's own search phrase for a single-product order (e.g. "brake
+  -- pads") — re-run when admin marks the product unavailable, so the
+  -- alternatives match what they asked for, not the rejected product's
+  -- catalog name. Multi-item orders keep it per line in items[].searchQuery.
+  search_query            TEXT,
   created_at              TIMESTAMPTZ DEFAULT NOW(),
   updated_at              TIMESTAMPTZ DEFAULT NOW()
 );
@@ -542,10 +554,13 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS service_price NUMERIC(12,2);
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS admin_hidden BOOLEAN DEFAULT false;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS stock_confirmation_courtesy_sent BOOLEAN DEFAULT false;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS stock_confirmation_admin_reminder_sent BOOLEAN DEFAULT false;
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS stock_confirmation_requested_at TIMESTAMPTZ;
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS items JSONB;
 -- One part-type choice (OEM/Aftermarket/New/Second Hand) per order, asked
 -- once before search and applied to every part in it — not per line item.
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS part_type TEXT;
+-- Customer's search phrase, re-used for the alternatives search (see above).
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS search_query TEXT;
 
 -- Retarget orders.product_id's FK from products(id) to product_suppliers(id)
 -- on an existing database — see the column comment above. Guarded so a
@@ -628,8 +643,8 @@ END $$;
 -- ============================================================
 CREATE TABLE IF NOT EXISTS admin_alerts (
   id            SERIAL PRIMARY KEY,
-  type          TEXT NOT NULL,              -- 'payment_proof' | 'in_person_payment' | 'order_status_request'
-  order_number  TEXT REFERENCES orders(number),
+  type          TEXT NOT NULL,              -- 'payment_proof' | 'in_person_payment' | 'order_status_request' | 'supplier_inquiry'
+  order_number  TEXT REFERENCES orders(number), -- NULL for 'supplier_inquiry' (no order exists yet)
   message       TEXT NOT NULL,
   read_at       TIMESTAMPTZ,
   created_at    TIMESTAMPTZ DEFAULT NOW()
@@ -722,15 +737,24 @@ CREATE TABLE IF NOT EXISTS customers (
   contact_count        INT DEFAULT 1,
   active               BOOLEAN DEFAULT true,
   needs_review         BOOLEAN DEFAULT false,   -- set when a profile field was accepted after exhausting validation retries
-  needs_review_reason  TEXT                     -- which field(s) failed validation and why, for admin follow-up
+  needs_review_reason  TEXT,                    -- which field(s) failed validation and why, for admin follow-up
+  locale               TEXT DEFAULT 'pt',       -- 'pt' | 'en' — conversation language, set ONLY by the customer's explicit choice (🌐 menu/welcome button)
+  -- Delivery-point coordinates from a shared WhatsApp location (last known,
+  -- like address). NULL when the address was typed. `address` still holds the
+  -- readable form (place + landmark) for PDFs/couriers.
+  address_lat          NUMERIC(9,6),
+  address_lng          NUMERIC(9,6)
 );
 
--- Conversation locale used to be stamped here once from the customer's first
--- message and never re-evaluated (sticky) — removed as of 2026-07-17 in favor
--- of per-message detection cached in Redis session state (session.service.ts's
--- saveLocale/getLocale), so a customer switching language mid-conversation
--- gets answered in whatever they just typed instead of a frozen locale.
-ALTER TABLE customers DROP COLUMN IF EXISTS locale;
+-- Conversation locale history: 2026-07-17 removed a column that was guessed
+-- once from the first message, in favor of per-message detection; 2026-10-26
+-- removed that detection too (an isolated "Hi" flipped an Angolan customer to
+-- English) and brought the column back — Angolan Portuguese by default, English
+-- only when the customer explicitly picks it. Never inferred from message text.
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS locale TEXT DEFAULT 'pt';
+-- Added 2026-10-26 — delivery point from a shared WhatsApp location.
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS address_lat NUMERIC(9,6);
+ALTER TABLE customers ADD COLUMN IF NOT EXISTS address_lng NUMERIC(9,6);
 
 -- Added 2026-07-27 — flags a profile field that was accepted with a
 -- needs_review reason after exhausting validation retries (see validation.service.ts).

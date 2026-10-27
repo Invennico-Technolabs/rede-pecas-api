@@ -148,7 +148,7 @@ Table orders {
   supplier_id int [ref: > suppliers.id]
   quantity int [default: 1]
   unit_price numeric(12,2)
-  status text [default: 'awaiting_payment', note: 'awaiting_payment (placeholder while service decision pending) → awaiting_stock_confirmation (admin panel) → stock_unavailable (terminal) | awaiting_alternative_resolution (basket orders only — every known item decided, waiting on customer to pick a substitute for whatever was unavailable; still shown in the admin stock-confirmation view, just non-actionable; returns to awaiting_stock_confirmation once a swap needs admin confirmation) | awaiting_payment_method → awaiting_bank_subtype (transfer/deposit only) → awaiting_payment_proof | awaiting_agent_confirmation → payment_proof_received → approved | rejected. cancelled: legacy value, no longer set by any code path — see admin_hidden']
+  status text [default: 'awaiting_payment', note: 'awaiting_payment (placeholder while service decision pending) → awaiting_stock_confirmation (admin panel) → stock_unavailable (terminal) | awaiting_alternative_resolution (basket orders only — every known item decided, waiting on customer to pick a substitute for whatever was unavailable; still shown in the admin stock-confirmation view, just non-actionable; returns to awaiting_stock_confirmation once a swap needs admin confirmation) | awaiting_customer_details (stock confirmed, collecting address/NIF before the proforma) → awaiting_payment_method → awaiting_bank_subtype (transfer/deposit only) → awaiting_payment_proof | awaiting_agent_confirmation → payment_proof_received → approved | rejected. cancelled: legacy value, no longer set by any code path — see admin_hidden']
   payment_method text [note: 'bank_transfer | bank_deposit | multicaixa_express | mobile_pos']
   approved_by text
   approved_at timestamptz
@@ -159,9 +159,11 @@ Table orders {
   service_price numeric(12,2)
   stock_confirmation_courtesy_sent boolean [default: false, note: '20-min "still confirming" courtesy message sent once']
   stock_confirmation_admin_reminder_sent boolean [default: false, note: '15-min admin-reminder WhatsApp nudge sent once']
+  stock_confirmation_requested_at timestamptz [note: 'when the order last entered awaiting_stock_confirmation — the courtesy/admin-reminder sweeps measure from here, not created_at']
   admin_hidden boolean [default: false, note: 'admin-grid-only soft delete, approved orders only (DELETE /admin/orders/:number) — never touches the real order/customer, no notification sent']
   items jsonb [note: 'multi-product "basket" orders only (2026-07-27) — NULL for legacy single-product orders. Array of {itemId, productId, productName, reference, supplierId, supplierName, quantity, unitPrice, serviceName, servicePrice, availabilityStatus}, one entry per product; product_id/unit_price/service_name/service_price above stay NULL when this is set']
   part_type text [note: 'OEM | Aftermarket | New | Second Hand — one choice per order, asked once before search, applies to every item']
+  search_query text [note: 'Customer search phrase for a single-product order (multi-item: items[].searchQuery) — re-run for the alternatives search when admin marks the product unavailable']
   created_at timestamptz [default: `NOW()`]
   updated_at timestamptz [default: `NOW()`]
 
@@ -194,8 +196,8 @@ Table order_counters {
 
 Table admin_alerts {
   id serial [pk]
-  type text [not null, note: 'payment_proof | in_person_payment | order_status_request']
-  order_number text [ref: > orders.number]
+  type text [not null, note: 'payment_proof | in_person_payment | order_status_request | supplier_inquiry']
+  order_number text [ref: > orders.number, note: 'NULL for supplier_inquiry (no order yet)']
   message text [not null]
   read_at timestamptz
   created_at timestamptz [default: `NOW()`]
@@ -232,6 +234,9 @@ Table customers {
   active boolean [default: true]
   needs_review boolean [default: false, note: 'set when a profile field was accepted after exhausting validation retries']
   needs_review_reason text [note: 'which field(s) failed validation and why, for admin follow-up']
+  locale text [default: 'pt', note: 'pt | en — conversation language, set only by the customer explicitly choosing it (🌐 menu/welcome button), never detected']
+  address_lat numeric(9,6) [note: 'delivery point from a shared WhatsApp location — NULL when the address was typed']
+  address_lng numeric(9,6) [note: 'delivery point from a shared WhatsApp location — NULL when the address was typed']
 
   indexes {
     registration_status

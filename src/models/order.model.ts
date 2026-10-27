@@ -45,6 +45,9 @@ export interface OrderItemEntry {
   // productIds already offered and rejected/skipped for this item slot, so a
   // later alternative search never re-offers the same one twice.
   excludedProductIds?: number[];
+  // The customer's search phrase this line was picked from — re-run for the
+  // alternatives search when admin marks it unavailable.
+  searchQuery?: string | null;
 }
 
 const STOCK_STATUS_CASE_SQL = `
@@ -83,24 +86,27 @@ const ITEMS_SUPPLIER_CASE_SQL = `CASE WHEN o.items IS NOT NULL THEN (o.items->0-
 
 /**
  * Inserts a new `orders` row for a customer/product pair with status
- * `awaiting_payment`, quantity fixed at 1 and the unit price snapshotted from the product.
+ * `awaiting_payment`, quantity fixed at 1, the unit price snapshotted from
+ * the product, and the customer's search phrase (for a later alternatives search).
  */
 export async function createOrder(
   orderNumber: string,
   phone: string,
   item: Product,
-  partType: string | null = null
+  partType: string | null = null,
+  searchQuery: string | null = null
 ): Promise<void> {
   await db.query(
-    `INSERT INTO orders (number, customer_phone, product_id, supplier_id, quantity, unit_price, part_type, status, created_at)
-     VALUES ($1, $2, $3, $4, 1, $5, $6, 'awaiting_payment', NOW())`,
-    [orderNumber, phone, item.id, item.supplier_id, item.price, partType]
+    `INSERT INTO orders (number, customer_phone, product_id, supplier_id, quantity, unit_price, part_type, search_query, status, created_at)
+     VALUES ($1, $2, $3, $4, 1, $5, $6, $7, 'awaiting_payment', NOW())`,
+    [orderNumber, phone, item.id, item.supplier_id, item.price, partType, searchQuery]
   );
 }
 
 export interface MultiItemDraft {
   product: Product;
   service: { name: string; price: number } | null;
+  query?: string;
 }
 
 /**
@@ -129,6 +135,7 @@ export async function createMultiItemOrder(
     serviceName: draft.service?.name ?? null,
     servicePrice: draft.service?.price ?? null,
     availabilityStatus: 'pending',
+    searchQuery: draft.query ?? null,
   }));
 
   await db.query(
@@ -249,6 +256,33 @@ export async function replaceOrderItemWithAlternative(
 }
 
 /**
+ * Swaps a single-product order's product for a customer-chosen alternative
+ * after admin marked the original unavailable — the same order row is kept
+ * (no new order number). Drops any attached service (it was matched to the
+ * rejected product) and resets the stock-confirmation sweep flags, since the
+ * alternative starts a fresh admin confirmation wait. No-op on a multi-item
+ * order (see replaceOrderItemWithAlternative for those).
+ */
+export async function replaceOrderProductWithAlternative(
+  orderNumber: string,
+  product: AlternativeProduct
+): Promise<void> {
+  await db.query(
+    `UPDATE orders
+     SET product_id = $2,
+         supplier_id = $3,
+         unit_price = $4,
+         service_name = NULL,
+         service_price = NULL,
+         stock_confirmation_courtesy_sent = false,
+         stock_confirmation_admin_reminder_sent = false,
+         updated_at = NOW()
+     WHERE number = $1 AND items IS NULL`,
+    [orderNumber, product.id, product.supplier_id, product.price]
+  );
+}
+
+/**
  * Marks a line item 'declined' — the customer explicitly skipped it rather
  * than picking an offered alternative. Terminal: unlike 'unavailable', this
  * never triggers another alternative-search round, and the item is simply
@@ -300,6 +334,14 @@ export async function getLatestOrderByStatus(phone: string, statuses: string[]):
 export async function updateOrderStatus(orderNumber: string, status: string, additionalFields: any = {}): Promise<void> {
   const setClauses = [`status = $2`, `updated_at = NOW()`];
   const params: any[] = [orderNumber, status];
+
+  // Start (or restart, when a swapped-in alternative needs its own admin
+  // decision) the stock-confirmation wait clock the courtesy/admin-reminder
+  // sweeps measure from — not created_at, which predates the order-profile
+  // step and made "sorry for the delay" fire right after "let me check".
+  if (status === 'awaiting_stock_confirmation') {
+    setClauses.push(`stock_confirmation_requested_at = NOW()`);
+  }
 
   if (additionalFields.approved_by) {
     setClauses.push(`approved_by = $${setClauses.length + 2}`);
@@ -395,7 +437,7 @@ export async function getOrdersPendingApproval(): Promise<OrderInfo[]> {
     LEFT JOIN products p ON p.id = ps.product_id
     LEFT JOIN suppliers s ON s.id = o.supplier_id
     WHERE o.status IN (
-      'awaiting_payment', 'awaiting_payment_method', 'awaiting_bank_subtype',
+      'awaiting_payment', 'awaiting_customer_details', 'awaiting_payment_method', 'awaiting_bank_subtype',
       'awaiting_payment_proof', 'awaiting_proof_verification', 'awaiting_agent_confirmation', 'payment_proof_received'
     )
     ORDER BY o.created_at DESC
@@ -445,7 +487,7 @@ export async function getOrdersAwaitingCourtesyMessage(minMinutes: number): Prom
     `SELECT number, customer_phone FROM orders
      WHERE status = 'awaiting_stock_confirmation'
        AND stock_confirmation_courtesy_sent = false
-       AND created_at < NOW() - ($1 || ' minutes')::interval`,
+       AND COALESCE(stock_confirmation_requested_at, created_at) < NOW() - ($1 || ' minutes')::interval`,
     [minMinutes]
   );
   return rows;
@@ -482,7 +524,7 @@ export async function getOrdersAwaitingAdminReminder(minMinutes: number): Promis
      LEFT JOIN customers c ON c.phone = o.customer_phone
      WHERE o.status = 'awaiting_stock_confirmation'
        AND o.stock_confirmation_admin_reminder_sent = false
-       AND o.created_at < NOW() - ($1 || ' minutes')::interval`,
+       AND COALESCE(o.stock_confirmation_requested_at, o.created_at) < NOW() - ($1 || ' minutes')::interval`,
     [minMinutes]
   );
   return rows;

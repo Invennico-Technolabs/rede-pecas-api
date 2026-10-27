@@ -7,17 +7,16 @@ import * as orderProfileService from '../services/orderProfile.service.js';
 import * as orderStatusService from '../services/orderStatus.service.js';
 import * as paymentService from '../services/payment.service.js';
 import * as sessionService from '../services/session.service.js';
-import { extractProductNames } from '../services/ai.service.js';
 import { sendReply, sendReplyButtons } from '../services/reply.service.js';
 import { sendWhatsAppButtons, sendTypingIndicator, sendWhatsAppMessage } from '../services/whatsapp.service.js';
 import { getAdminByPhone, getAllAdmins } from '../models/adminUser.model.js';
 import { config } from '../config/config.js';
-import { GREETING_PATTERN, detectMessageLocale } from '../utils/greeting.js';
+import { GREETING_PATTERN, isCourtesyMessage, isBareReply } from '../utils/greeting.js';
+import { extractProductNames } from '../services/ai.service.js';
+import { extractBoldTerms } from '../services/humanize.service.js';
 import { runSerialized } from '../utils/keyedQueue.js';
 
 const HUMAN_HANDOFF_PATTERN = /\b(atendente|humano|falar com (algu[eé]m|pessoa)|operador|suporte humano|human|agent|representative)\b/i;
-
-const ACKNOWLEDGMENT_PATTERN = /^(ok(ay)?|k+|t[áa]\s*bem|obrigad[oa]s?|valeu|thanks?|thank\s*you|cool|perfeito|beleza|👍+|🙏+|✅+)[.!?\s]*$/i;
 
 const ORDER_STATUS_PATTERN = /\b(estado do (meu )?pedido|onde est[áa] (o meu )?pedido|order status|where('?s| is) my order)\b/i;
 
@@ -71,13 +70,18 @@ export async function receiveWebhookMessage(req: Request, res: Response): Promis
     const contextMessageId: string | null = msg.context?.id || null;
     const mediaType = msg.type;
     const mediaId = msg.image?.id || msg.document?.id || null;
+    // A shared WhatsApp location (📍) — the delivery address step asks for one.
+    const location: orderProfileService.SharedLocation | null =
+      msg.type === 'location' && typeof msg.location?.latitude === 'number' && typeof msg.location?.longitude === 'number'
+        ? { latitude: msg.location.latitude, longitude: msg.location.longitude, name: msg.location.name ?? null, address: msg.location.address ?? null }
+        : null;
 
     logger.info(`[${phone}] Webhook type: ${mediaType}, text: ${customerText}`);
 
     // One customer's messages are processed strictly in arrival order —
     // concurrent runs would race on the same session/order state.
     await runSerialized(phone, () =>
-      processMessageFlow(phone, customerText, mediaType, mediaId, listReplyId, buttonReplyId, contextMessageId)
+      processMessageFlow(phone, customerText, mediaType, mediaId, listReplyId, buttonReplyId, contextMessageId, location)
     );
   } catch (error: any) {
     logger.error('Error in WhatsApp webhook processing', error);
@@ -96,7 +100,8 @@ async function processMessageFlow(
   mediaId: string | null,
   listReplyId: string | null = null,
   buttonReplyId: string | null = null,
-  contextMessageId: string | null = null
+  contextMessageId: string | null = null,
+  location: orderProfileService.SharedLocation | null = null
 ): Promise<void> {
   const admin = await getAdminByPhone(phone);
   if (admin) {
@@ -120,9 +125,10 @@ async function processMessageFlow(
     return;
   }
 
+  // No language detection from message text — the conversation stays in
+  // Angolan Portuguese unless the customer explicitly picks English (🌐
+  // option, routed below). See customerService.resolveLocale.
   if (customerText) {
-    const detected = detectMessageLocale(customerText);
-    if (detected) await sessionService.saveLocale(phone, detected);
     await sessionService.saveLastMessage(phone, customerText);
   }
 
@@ -150,6 +156,17 @@ async function processMessageFlow(
 
   const firstName = customer.name?.split(' ')[0] || 'Cliente';
 
+  // The final invoice's "Order status" button belongs to a finished order,
+  // so it's answered whatever the session state — approval resets the
+  // session (resetSearchSession) and a tap hours later finds it expired, and
+  // the fresh-session check below would otherwise turn the tap into the main
+  // menu. Deliberately runs before markSessionActive, so the customer's next
+  // message is still a fresh session (greeting/tap → main menu).
+  if (buttonReplyId?.startsWith('order_status_')) {
+    await orderStatusService.processOrderStatusButton(phone, buttonReplyId);
+    return;
+  }
+
   const freshSession = await sessionService.isNewSession(phone);
   await sessionService.markSessionActive(phone);
 
@@ -159,12 +176,23 @@ async function processMessageFlow(
     : false;
 
   if (freshSession && customer.registration_status === 'complete' && !needsVehicleId) {
-    const firstName = customer.name?.split(' ')[0] || 'Cliente';
-    await sendReply(phone, messages.onboarding.welcomeBack(firstName), { contextual: true });
-    if (!mediaId) {
-      const askedPart = await vehicleService.sendAskPartPrompt(phone);
-      if (askedPart) return;
+    const isGreeting = !!customerText && GREETING_PATTERN.test(customerText.trim());
+    if (!mediaId && !activeCollection && (isGreeting || mediaType === 'interactive')) {
+      // A greeting (or a tap on a prompt from a previous session) gets the
+      // main menu — no vehicle question until the customer says what they want.
+      await customerService.sendMainMenu(phone, firstName);
+      return;
     }
+    // A thank-you as the session's first message (typically right after the
+    // final invoice — approval resets the session) gets only the courtesy
+    // reply further down, not a "welcome back" stacked in front of it.
+    if (!customerText || !isCourtesyMessage(customerText)) {
+      await sendReply(phone, messages.onboarding.welcomeBack(firstName), { contextual: true });
+    }
+    // A real request as the session's first message (e.g. "engine oil") is
+    // processed below instead of being dropped — the vehicle question comes
+    // from the search fallback. Media (e.g. a payment proof) falls through as before.
+    if (!mediaId) await sessionService.markPartPromptSent(phone);
   }
 
   if (freshSession && needsVehicleId) {
@@ -186,8 +214,33 @@ async function processMessageFlow(
     }
   }
 
-  if (buttonReplyId?.startsWith('order_status_')) {
-    await orderStatusService.processOrderStatusButton(phone, buttonReplyId);
+  // 🌐 language option — a button on the first welcome or a row in the main
+  // menu. Routed before registration so it's never taken as the customer's name.
+  if (buttonReplyId === customerService.SWITCH_LANGUAGE_ID || listReplyId === customerService.SWITCH_LANGUAGE_ID) {
+    await customerService.switchLanguage(phone, customer);
+    return;
+  }
+
+  // Main-menu list taps (customerService.sendMainMenu) — only ever shown to a
+  // customer with a complete profile and a vehicle on file.
+  if (listReplyId?.startsWith('menu_') && customer.registration_status === 'complete' && !needsVehicleId) {
+    if (listReplyId === 'menu_search_parts') {
+      await vehicleService.sendAskPartPrompt(phone);
+    } else if (listReplyId === 'menu_order_status') {
+      await orderStatusService.handleOrderStatusRequest(phone, customer);
+    } else if (listReplyId === 'menu_add_vehicle') {
+      await vehicleService.startAddVehicleFlow(phone);
+    }
+    return;
+  }
+
+  // Shared WhatsApp location: the delivery-address answer while the order
+  // profile wizard is at its address step; anywhere else, a polite "not
+  // needed now" — it has no text, so it used to be silently dropped below.
+  if (location) {
+    const stage = await sessionService.getOrderProfileStage(phone);
+    if (stage && await orderProfileService.processOrderProfileLocation(phone, location, stage)) return;
+    await sendReply(phone, messages.common.locationNotNeeded());
     return;
   }
 
@@ -200,6 +253,25 @@ async function processMessageFlow(
   if (!needsVehicleId && customerText && vehicleService.isAddVehicleRequest(customerText)) {
     await vehicleService.startAddVehicleFlow(phone);
     return;
+  }
+
+  // Supplier inquiry details (customer said "yes, check with suppliers" after
+  // a zero-results search): the next part photo or typed reference goes to
+  // the team. Must run before image routing below, or the photo would be
+  // taken as a vehicle document / payment proof. Greetings, courtesies and
+  // button/list taps aren't details — they fall through as usual.
+  const supplierInquiry = await sessionService.getAwaitingSupplierInquiryDetails(phone);
+  if (supplierInquiry) {
+    const isPhoto = mediaType === 'image' && !!mediaId;
+    const isDetailsText = mediaType !== 'interactive' && !!customerText
+      && !GREETING_PATTERN.test(customerText.trim()) && !isCourtesyMessage(customerText);
+    if (isPhoto || isDetailsText) {
+      await productService.submitSupplierInquiry(phone, firstName, supplierInquiry, {
+        text: customerText,
+        imageMediaId: isPhoto ? mediaId : null,
+      });
+      return;
+    }
   }
 
   const documentRetryChoiceShown = await sessionService.wasDocumentRetryChoiceShown(phone);
@@ -275,6 +347,12 @@ async function processMessageFlow(
     if (handled) return;
   }
 
+  const pendingSupplierInquiryOffer = await sessionService.getPendingSupplierInquiryOffer(phone);
+  if (pendingSupplierInquiryOffer) {
+    const handled = await productService.processSupplierInquiryOffer(phone, customerText, pendingSupplierInquiryOffer);
+    if (handled) return;
+  }
+
   const pendingServiceOffer = await sessionService.getPendingServiceOffer(phone);
   if (pendingServiceOffer) {
     const handled = await productService.processServiceSelection(phone, customerText, listReplyId, pendingServiceOffer);
@@ -339,11 +417,39 @@ async function processMessageFlow(
     if (handled) return;
   }
 
-  const invitedToAskForPart = await sessionService.wasPartPromptSent(phone);
   const isGreeting = GREETING_PATTERN.test(customerText.trim());
-  if (!invitedToAskForPart || isGreeting) {
-    const greeting = isGreeting ? { name: customer.name?.split(' ')[0] || 'Cliente' } : undefined;
-    const asked = await vehicleService.sendAskPartPrompt(phone, greeting);
+  if (isGreeting && await vehicleService.hasVehicleOnFile(phone)) {
+    await customerService.sendMainMenu(phone, firstName);
+    return;
+  }
+
+  // Payment chosen/sent but not yet approved: free text is almost always
+  // about that payment ("já paguei", "quando chega?"), so a message that
+  // isn't a part request gets the order's status instead of the part-search
+  // prompts. A real part request still goes on to a normal search, reusing
+  // this extraction. Taps, handoff, courtesy and status keywords keep their
+  // own handling below.
+  let extractedProductNames: string[] | null | undefined;
+  if (
+    mediaType !== 'interactive' &&
+    !HUMAN_HANDOFF_PATTERN.test(customerText) &&
+    !isCourtesyMessage(customerText) &&
+    !ORDER_STATUS_PATTERN.test(customerText.trim())
+  ) {
+    const postPaymentOrder = await paymentService.getPostPaymentOrder(phone);
+    if (postPaymentOrder) {
+      extractedProductNames = isBareReply(customerText) ? [] : await extractProductNames(customerText);
+      if (extractedProductNames && extractedProductNames.length === 0) {
+        logger.info(`[FLOW] ${phone} sent "${customerText}" while order ${postPaymentOrder.number} is ${postPaymentOrder.status} — sending its status.`);
+        await paymentService.sendPostPaymentStatus(phone, postPaymentOrder, firstName);
+        return;
+      }
+    }
+  }
+
+  const invitedToAskForPart = await sessionService.wasPartPromptSent(phone);
+  if (!invitedToAskForPart && mediaType !== 'interactive') {
+    const asked = await vehicleService.sendAskPartPrompt(phone);
     if (asked) return;
   }
 
@@ -362,14 +468,41 @@ async function processMessageFlow(
     }
   }
 
+  // A button/list tap nothing above claimed is an answer to a question that
+  // was already answered (e.g. a second payment-method tap after one was
+  // chosen — the bot's reply was plain text, so that prompt is still the
+  // "latest" and step 4 can't flag it) or whose state was lost. Its title
+  // ("✅ Yes, I have a NIF") is never a part name, so it must not reach the
+  // search fallback below — and it must not reset anything either: the
+  // conversation simply continues from where it is. Only an order stuck
+  // before stock confirmation (wizard state lost) is actively resumed.
+  if (mediaType === 'interactive') {
+    logger.info(`[FLOW] ${phone} tapped an option with no active flow ("${customerText}") — already answered, continuing.`);
+    if (await orderProfileService.resumeOrderProfileCapture(phone)) return;
+    await sendReply(phone, messages.common.alreadyAnswered());
+    return;
+  }
+
   if (HUMAN_HANDOFF_PATTERN.test(customerText)) {
     await sendReply(phone, messages.agent.transferToHuman(), { contextual: true });
     logger.info(`[SUPPORT] Customer ${phone} requested human support.`);
     return;
   }
 
-  if (ACKNOWLEDGMENT_PATTERN.test(customerText.trim())) {
-    logger.info(`[PRODUCT SEARCH] ${phone} sent a filler acknowledgment ("${customerText}") — not treating it as a search.`);
+  // "Thank you for the support" / "ok obrigado" — e.g. after a "not in
+  // stock" reply — is never a part search. One polite reply, throttled so a
+  // thanks -> "you're welcome" -> "ok" chain doesn't keep answering itself.
+  if (isCourtesyMessage(customerText)) {
+    logger.info(`[PRODUCT SEARCH] ${phone} sent a courtesy message ("${customerText}") — not treating it as a search.`);
+    if (await sessionService.claimCourtesyReply(phone)) {
+      await sendReply(phone, messages.common.courtesyReply(), { contextual: true });
+    }
+    // A thank-you right after a "nothing found" reply closes that search: the
+    // next message starts a fresh conversation (new session → main menu on a
+    // greeting) instead of being read against the old search state.
+    if (pendingSupplierInquiryOffer) {
+      await sessionService.resetSearchSession(phone);
+    }
     return;
   }
 
@@ -378,11 +511,25 @@ async function processMessageFlow(
     return;
   }
 
-  const productNames = await extractProductNames(customerText);
-  await sessionService.savePendingPartTypeChoice(phone, {
-    productNames: productNames && productNames.length > 1 ? productNames : null,
-    customerText,
-    customerName: firstName,
-  });
-  await productService.sendPartTypePrompt(phone, productNames);
+  // Search fallback — only for an actual part request. A bare yes/no/number
+  // (typically a reply to a prompt whose state expired) is rejected
+  // deterministically; anything else goes to Claude, which returns [] when
+  // the message isn't asking for a part (a question, a name/NIF/address,
+  // small talk). Neither ever starts a search. null = extraction failed →
+  // fail open and search the raw text, so an API outage never blocks a request.
+  const productNames = extractedProductNames !== undefined
+    ? extractedProductNames
+    : isBareReply(customerText) ? [] : await extractProductNames(customerText);
+  if (productNames && productNames.length === 0) {
+    logger.info(`[PRODUCT SEARCH] ${phone} message isn't a part request ("${customerText}") — not searching.`);
+    const notAPartRequest = messages.agent.notAPartRequest();
+    await sendReply(phone, notAPartRequest, { preserve: extractBoldTerms(notAPartRequest) });
+    return;
+  }
+
+  // Ask which vehicle this request is for (if none picked yet this session)
+  // before anything else — the request resumes right after the pick.
+  if (await vehicleService.askVehicleChoiceForRequest(phone, customerText, firstName, productNames)) return;
+
+  await productService.beginPartTypeChoice(phone, customerText, firstName, productNames);
 }

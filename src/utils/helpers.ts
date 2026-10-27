@@ -56,3 +56,19 @@ export function formatDateTime(value: Date | string | null): string | null {
   const get = (type: string) => parts.find((p) => p.type === type)?.value ?? "";
   return `${get("day")}/${get("month")}/${get("year")} ${get("hour")}:${get("minute")}`;
 }
+
+/**
+ * Formats a customer's saved delivery address for admin messages, appending a
+ * Google Maps link when the address came from a shared WhatsApp location
+ * (lat/lng set) so staff/couriers get the exact delivery point.
+ */
+export function formatAddressWithMap(
+  address: string | null | undefined,
+  lat: string | number | null | undefined,
+  lng: string | number | null | undefined,
+  fallback: string
+): string {
+  const text = address || fallback;
+  if (lat === null || lat === undefined || lng === null || lng === undefined) return text;
+  return `${text}\n🗺️ https://maps.google.com/?q=${lat},${lng}`;
+}

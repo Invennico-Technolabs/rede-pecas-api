@@ -51,6 +51,9 @@ export const clearPendingOptions = (phone: string): Promise<void> => deleteKey(`
 export interface BasketItemDraft {
   product: Product;
   service: { name: string; price: number } | null;
+  // The search phrase this product was picked from — saved on the order so
+  // an alternatives search re-runs it if admin marks the product unavailable.
+  query?: string;
 }
 
 export interface UnmatchedBasketItem {
@@ -71,6 +74,9 @@ export interface PendingBasket {
   // consolidated notice/waitlist-offer once the whole queue is drained,
   // instead of a repeated back-and-forth per failed item.
   unmatched: UnmatchedBasketItem[];
+  // The phrase whose results list is currently on screen — copied onto the
+  // item the customer picks from it (BasketItemDraft.query).
+  currentQuery?: string;
 }
 
 /**
@@ -93,8 +99,8 @@ export const clearPendingBasket = (phone: string): Promise<void> => deleteKey(`b
 // --- Part-type choice (OEM/Aftermarket/New/Second Hand) --------------------
 
 export interface PendingPartTypeChoice {
-  productNames: string[] | null; // null/single-item search vs. a multi-item basket request
-  customerText: string;          // original free text, re-used to run the search once resolved
+  productNames: string[] | null; // Claude-extracted part phrases (2+ = basket); null if extraction failed
+  customerText: string;          // original free text — search fallback when productNames is null
   customerName: string;
 }
 
@@ -144,6 +150,9 @@ export type OrderProfileStageName =
   | 'awaiting_company_nif'
   | 'awaiting_company_address'
   | 'awaiting_individual_address'
+  // After a shared WhatsApp location: one landmark ("ponto de referência")
+  // turns the coordinates into an address a courier can read.
+  | 'awaiting_address_landmark'
   | 'awaiting_individual_nif_choice'
   | 'awaiting_individual_nif_number';
 
@@ -155,6 +164,10 @@ export interface OrderProfileStage {
   customerType?: 'individual' | 'company';
   nif?: string | null;
   address?: string | null;
+  // Set only when the address came from a shared WhatsApp location.
+  addressLat?: number | null;
+  addressLng?: number | null;
+  addressPlace?: string | null; // place name/address WhatsApp attached to the pin, if any
 }
 
 /**
@@ -172,17 +185,19 @@ export const getOrderProfileStage = (phone: string): Promise<OrderProfileStage |
  */
 export const clearOrderProfileStage = (phone: string): Promise<void> => deleteKey(`orderProfileStage:${phone}`);
 
-// --- Alternatives for unavailable multi-item order lines -------------------
+// --- Alternatives for unavailable order lines -------------------------------
 
 export interface PendingAlternativeOffer {
   orderNumber: string;
-  itemId: number;
+  // The unavailable line item on a multi-item order. Absent for a
+  // single-product order — the order's own product is what gets swapped.
+  itemId?: number;
 }
 
 /**
  * Stores which order/item an alternative-products list currently on screen
  * belongs to, so the customer's list-tap/typed-digit reply resolves back to
- * the right unavailable line item on an existing multi-item order.
+ * the right unavailable product on the existing order instead of starting a new one.
  */
 export const savePendingAlternativeOffer = (phone: string, offer: PendingAlternativeOffer): Promise<void> =>
   setJSON(`altOffer:${phone}`, offer);
@@ -291,6 +306,35 @@ export async function getChosenVehicle(phone: string): Promise<number | null> {
   const data = await getString(`chosenVehicle:${phone}`);
   return data ? parseInt(data, 10) : null;
 }
+
+/**
+ * Forgets the session's chosen vehicle, so the next request asks "which vehicle is this for?" again.
+ */
+export const clearChosenVehicle = (phone: string): Promise<void> => deleteKey(`chosenVehicle:${phone}`);
+
+export interface DeferredPartRequest {
+  customerText: string;
+  customerName: string;
+  productNames?: string[] | null; // already extracted by Claude, reused after the vehicle pick
+}
+
+/**
+ * Holds a typed part request while the customer is asked which vehicle it's
+ * for, so the search can continue once they pick without them retyping it.
+ */
+export const saveDeferredPartRequest = (phone: string, request: DeferredPartRequest): Promise<void> =>
+  setJSON(`deferredPartRequest:${phone}`, request);
+
+/**
+ * Retrieves the part request waiting on a vehicle choice, if any.
+ */
+export const getDeferredPartRequest = (phone: string): Promise<DeferredPartRequest | null> =>
+  getJSON(`deferredPartRequest:${phone}`);
+
+/**
+ * Removes the part request waiting on a vehicle choice.
+ */
+export const clearDeferredPartRequest = (phone: string): Promise<void> => deleteKey(`deferredPartRequest:${phone}`);
 
 /**
  * Marks that the vehicle-ID entry option buttons (VIN/photo/manual) were just shown to this phone.
@@ -621,6 +665,82 @@ const INACTIVE_CUSTOMER_ALERT_TTL = 60 * 60 * 6;
  */
 export const claimInactiveCustomerAlert = (phone: string): Promise<boolean> =>
   claimKey(`inactiveAlert:${phone}`, INACTIVE_CUSTOMER_ALERT_TTL);
+
+// --- Supplier inquiry (zero-results fallback) ---------------------------------
+
+export interface SupplierInquiry {
+  query: string; // what the customer searched for, forwarded to the admins
+}
+
+/**
+ * Stores the "should our team check with suppliers?" offer sent after a
+ * search found nothing at all.
+ */
+export const savePendingSupplierInquiryOffer = (phone: string, inquiry: SupplierInquiry): Promise<void> =>
+  setJSON(`supplierInquiryOffer:${phone}`, inquiry);
+
+/**
+ * Retrieves the pending supplier-inquiry offer, if any.
+ */
+export const getPendingSupplierInquiryOffer = (phone: string): Promise<SupplierInquiry | null> =>
+  getJSON(`supplierInquiryOffer:${phone}`);
+
+/**
+ * Removes the pending supplier-inquiry offer once answered.
+ */
+export const clearPendingSupplierInquiryOffer = (phone: string): Promise<void> =>
+  deleteKey(`supplierInquiryOffer:${phone}`);
+
+/**
+ * Marks that the customer accepted the offer and the bot is waiting for a
+ * part photo or reference to forward to the team.
+ */
+export const saveAwaitingSupplierInquiryDetails = (phone: string, inquiry: SupplierInquiry): Promise<void> =>
+  setJSON(`supplierInquiryDetails:${phone}`, inquiry);
+
+/**
+ * Retrieves the inquiry still waiting for its photo/reference, if any.
+ */
+export const getAwaitingSupplierInquiryDetails = (phone: string): Promise<SupplierInquiry | null> =>
+  getJSON(`supplierInquiryDetails:${phone}`);
+
+/**
+ * Clears the waiting-for-details state once the inquiry was forwarded.
+ */
+export const clearAwaitingSupplierInquiryDetails = (phone: string): Promise<void> =>
+  deleteKey(`supplierInquiryDetails:${phone}`);
+
+// Search-related session state wiped by resetSearchSession. Deliberately
+// excludes anything tied to an order already in progress (orderProfile*,
+// altOffer/altResolution, stockUnavailable, restockOrder) and the
+// conversation-wide keys (locale, custname, lastmsg, chatlog, activePrompt).
+const SEARCH_SESSION_KEYS = [
+  'active', 'partPrompt', 'chosenVehicle', 'vehicleChoice', 'deferredPartRequest',
+  'options', 'basket', 'partTypeChoice', 'waitlist', 'basketWaitlist', 'serviceOffer',
+  'supplierInquiryOffer', 'supplierInquiryDetails',
+];
+
+/**
+ * Ends the current search conversation — e.g. after a "nothing found" reply
+ * the customer closed with a thank-you — so their next message starts fresh:
+ * with the `active:` key gone it's handled as a new session (a greeting gets
+ * the main menu, a real request is processed from scratch), and no stale
+ * offer, results list or chosen vehicle from the old search can catch it.
+ */
+export async function resetSearchSession(phone: string): Promise<void> {
+  await Promise.all(SEARCH_SESSION_KEYS.map((prefix) => deleteKey(`${prefix}:${phone}`)));
+}
+
+// A "thanks" -> "You're welcome" -> "ok" chain must not keep answering
+// itself, but a thank-you after a later, separate exchange deserves a reply.
+const COURTESY_REPLY_TTL = 60 * 10;
+
+/**
+ * Returns true at most once per COURTESY_REPLY_TTL window per phone — gates
+ * the "You're welcome" reply to a pure courtesy message (thanks / okay).
+ */
+export const claimCourtesyReply = (phone: string): Promise<boolean> =>
+  claimKey(`courtesyReply:${phone}`, COURTESY_REPLY_TTL);
 
 // --- Chat transcript --------------------------------------------------------
 

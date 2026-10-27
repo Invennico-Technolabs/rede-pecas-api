@@ -29,11 +29,14 @@ export function errorHandler(err: ApiError, req: Request, res: Response, _next: 
     message = 'Internal Server Error';
   }
 
-  const logLine = `[Error Handler] ${statusCode} - ${message} - Stack: ${err.stack}`;
+  // Expected client errors (expired token, failed validation, not found) get
+  // one line — their stack only ever points at the middleware that threw
+  // them, and an access-token expiry alone used to print one full trace per
+  // concurrent admin-panel request. Real failures keep the full stack.
   if (err.isOperational && statusCode < 500) {
-    logger.warn(logLine);
+    logger.warn(`[Error Handler] ${statusCode} ${req.method} ${req.originalUrl} - ${message}`);
   } else {
-    logger.error(logLine);
+    logger.error(`[Error Handler] ${statusCode} ${req.method} ${req.originalUrl} - ${message} - Stack: ${err.stack}`);
   }
 
   res.status(statusCode).json({

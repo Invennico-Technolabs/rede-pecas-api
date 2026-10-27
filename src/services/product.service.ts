@@ -28,6 +28,7 @@ import {
   getOrderAmount,
   setOrderItemAvailability,
   replaceOrderItemWithAlternative,
+  replaceOrderProductWithAlternative,
   declineOrderItem,
   OrderItemEntry,
   getOrdersAwaitingCourtesyMessage,
@@ -39,8 +40,11 @@ import { getCustomerVehicles } from '../models/vehicle.model.js';
 import { getCustomerByPhone } from '../models/customer.model.js';
 import { getAllAdmins } from '../models/adminUser.model.js';
 import { resolveMessages, resolveLocale } from './customer.service.js';
-import { sendWhatsAppMessage, sendWhatsAppButtons } from './whatsapp.service.js';
+import { sendWhatsAppMessage, sendWhatsAppButtons, sendWhatsAppImage } from './whatsapp.service.js';
+import { createAlert } from '../models/alert.model.js';
 import { sendReply, sendReplyButtons, sendReplyList } from './reply.service.js';
+import { extractBoldTerms } from './humanize.service.js';
+import { extractProductNames } from './ai.service.js';
 import { generateProformaPDF, sendProformaWhatsApp } from './pdf.service.js';
 import { askPaymentMethod } from './payment.service.js';
 import { startOrderProfileCapture } from './orderProfile.service.js';
@@ -48,6 +52,11 @@ import {
   savePendingOptions,
   clearPendingOptions,
   savePendingWaitlistOffer,
+  savePendingSupplierInquiryOffer,
+  clearPendingSupplierInquiryOffer,
+  saveAwaitingSupplierInquiryDetails,
+  clearAwaitingSupplierInquiryDetails,
+  SupplierInquiry,
   clearPendingWaitlistOffer,
   savePendingServiceOffer,
   clearPendingServiceOffer,
@@ -65,6 +74,7 @@ import {
   savePendingAlternativeResolution,
   getPendingAlternativeResolution,
   clearPendingAlternativeResolution,
+  savePendingPartTypeChoice,
   clearPendingPartTypeChoice,
   savePendingBasketWaitlistOffer,
   clearPendingBasketWaitlistOffer,
@@ -125,9 +135,10 @@ export async function searchAndRespond(phone: string, customerText: string, cust
       await savePendingWaitlistOffer(phone, { productId: candidate.id, productName: candidate.name, query: customerText });
     } else {
       // Nothing at all matched — not even an out-of-stock listing — so
-      // there's no real product to waitlist against. Distinct wording from
-      // noStockFound() above: no question, no promise we can't keep.
-      await sendReply(phone, messages.agent.noStockFoundNoWaitlist());
+      // there's no real product to waitlist against. Instead offer to have
+      // the team check with suppliers directly (processSupplierInquiryOffer).
+      await sendReplyButtons(phone, messages.agent.noStockFoundNoWaitlist(), messages.agent.supplierInquiryButtons);
+      await savePendingSupplierInquiryOffer(phone, { query: customerText });
     }
     return;
   }
@@ -139,7 +150,7 @@ export async function searchAndRespond(phone: string, customerText: string, cust
   // already-empty queue) so its selection is summarized and turned into an
   // order through the exact same path as a multi-item basket — see
   // processBasketProductSelection/advanceBasket below.
-  await savePendingBasket(phone, { queue: [], items: [], partType, unmatched: [] });
+  await savePendingBasket(phone, { queue: [], items: [], partType, unmatched: [], currentQuery: customerText });
 
   const body = vehicle
     ? messages.agent.searchListBodyForVehicle(options.length, customerText, vehicle.make, vehicle.model, vehicle.year, customerName)
@@ -155,6 +166,11 @@ export async function searchAndRespond(phone: string, customerText: string, cust
 export async function startBasketSearch(phone: string, productNames: string[], customerName: string, partType: string = ''): Promise<void> {
   const messages = await resolveMessages(phone);
   await sendReply(phone, messages.agent.basketRequestSummary(productNames, customerName));
+  // Sent once for the whole basket — searchNextBasketItem deliberately
+  // doesn't repeat it per item, since items after the first are searched
+  // right after the customer's previous pick (or back-to-back when an item
+  // has no match), and a fresh "checking stock" each time reads as spam.
+  await sendReply(phone, messages.agent.checkingStock());
 
   await savePendingBasket(phone, { queue: productNames, items: [], partType, unmatched: [] });
   await searchNextBasketItem(phone, customerName);
@@ -181,6 +197,25 @@ function buildPartTypeListRows(rows: { id: string; title: string; description: s
 }
 
 /**
+ * Turns a customer's free-text part request into the part-type question:
+ * Claude splits it into part phrases, the phrases are held as the pending
+ * part-type choice, and the OEM/Aftermarket/New/Used list is sent. Shared by
+ * the controller's search fallback and the resumed request after a vehicle pick.
+ */
+export async function beginPartTypeChoice(
+  phone: string,
+  customerText: string,
+  customerName: string,
+  // Already-extracted part phrases (the controller extracts before asking
+  // which vehicle); undefined means "extract now".
+  extracted?: string[] | null
+): Promise<void> {
+  const productNames = extracted !== undefined ? extracted : await extractProductNames(customerText);
+  await savePendingPartTypeChoice(phone, { productNames, customerText, customerName });
+  await sendPartTypePrompt(phone, productNames);
+}
+
+/**
  * Sends the one-time-per-order "what type of parts?" list, asked once
  * Claude has identified the part(s) from the customer's message and before
  * any search runs.
@@ -188,11 +223,15 @@ function buildPartTypeListRows(rows: { id: string; title: string; description: s
 export async function sendPartTypePrompt(phone: string, productNames: string[] | null): Promise<void> {
   const messages = await resolveMessages(phone);
   const count = productNames?.length || 1;
+  const body = messages.agent.askPartTypeBody(count);
+  // preserve the bold type names so a humanized rewrite can't drift into the
+  // persona's generic "Parts, Accessories, Lubricants or Services" range.
   await sendReplyList(
     phone,
-    messages.agent.askPartTypeBody(count),
+    body,
     messages.agent.askPartTypeButton(),
-    buildPartTypeListRows(messages.agent.partTypeRows)
+    buildPartTypeListRows(messages.agent.partTypeRows),
+    { preserve: extractBoldTerms(body) }
   );
 }
 
@@ -227,7 +266,11 @@ export async function processPartTypeChoice(
   if (pending.productNames && pending.productNames.length > 1) {
     await startBasketSearch(phone, pending.productNames, pending.customerName, partType);
   } else {
-    await searchAndRespond(phone, pending.customerText, pending.customerName, partType);
+    // Search the extracted part phrase, not the raw message — search is
+    // all-words matching, so filler like "I need ... please" would otherwise
+    // fail every query. Falls back to the raw text if extraction failed.
+    const part = pending.productNames?.[0] ?? pending.customerText;
+    await searchAndRespond(phone, part, pending.customerName, partType);
   }
   return true;
 }
@@ -250,7 +293,6 @@ async function searchNextBasketItem(phone: string, customerName: string): Promis
 
   const messages = await resolveMessages(phone);
   logger.info(`[PRODUCT SEARCH][BASKET] ${phone} searching basket item: "${part}"`);
-  await sendReply(phone, messages.agent.checkingStock());
 
   const { vehicle, options } = await runProductSearch(phone, part, basket.partType || null);
 
@@ -267,7 +309,7 @@ async function searchNextBasketItem(phone: string, customerName: string): Promis
     return;
   }
 
-  await savePendingBasket(phone, { ...basket, queue: rest });
+  await savePendingBasket(phone, { ...basket, queue: rest, currentQuery: part });
 
   logger.info(`[PRODUCT SEARCH][BASKET] ${phone} found ${options.length} match(es) for "${part}": ${options.map(o => o.name).join(', ')}`);
   await savePendingOptions(phone, options);
@@ -319,7 +361,7 @@ export async function processBasketProductSelection(
     return true;
   }
 
-  await savePendingBasket(phone, { ...basket, items: [...basket.items, { product: choice, service: null }] });
+  await savePendingBasket(phone, { ...basket, items: [...basket.items, { product: choice, service: null, query: basket.currentQuery }] });
   await advanceBasket(phone);
   return true;
 }
@@ -388,7 +430,8 @@ async function advanceBasket(phone: string): Promise<void> {
         candidates: Array.from(candidates, ([productId, productName]) => ({ productId, productName })),
       });
     } else {
-      await sendReply(phone, messages.agent.basketSearchAllUnavailableNoWaitlist());
+      await sendReplyButtons(phone, messages.agent.basketSearchAllUnavailableNoWaitlist(), messages.agent.supplierInquiryButtons);
+      await savePendingSupplierInquiryOffer(phone, { query: basket.unmatched.map((u) => u.query).join(', ') });
     }
     return;
   }
@@ -404,14 +447,16 @@ async function advanceBasket(phone: string): Promise<void> {
   const partType = basket.partType || null;
   if (basket.items.length === 1) {
     const only = basket.items[0];
-    await createOrder(orderNumber, phone, only.product, partType);
+    await createOrder(orderNumber, phone, only.product, partType, only.query ?? null);
     if (only.service) {
       await addServiceToOrder(orderNumber, only.service.name, only.service.price);
     }
   } else {
     await createMultiItemOrder(orderNumber, phone, basket.items, partType);
   }
-  await startOrderProfileCapture(phone, orderNumber);
+  // Supplier stock check comes first — address/NIF are only asked once the
+  // part is confirmed available (confirmStockAndFinalizeOrder / finalizeMultiItemOrder).
+  await requestStockConfirmation(phone, orderNumber);
 }
 
 /**
@@ -670,7 +715,7 @@ export async function processAdminItemStockReply(adminPhone: string, buttonReply
     ack = t.admin.itemRecordedWaitingOnOthers(orderNumber);
   } else if (updated?.status === 'stock_unavailable') {
     ack = t.admin.itemRecordedAllUnavailable(orderNumber);
-  } else if (updated?.status === 'awaiting_payment_method') {
+  } else if (updated?.status === 'awaiting_customer_details') {
     ack = action === 'confirm' ? t.admin.confirmedAck(orderNumber) : t.admin.unavailableAck(orderNumber);
   } else {
     // Not pending, not stock_unavailable, not sent to payment — every item
@@ -732,8 +777,7 @@ async function finalizeMultiItemOrder(orderNumber: string, items: OrderItemEntry
   if (!order) throw new ApiError(404, `Order ${orderNumber} not found`);
 
   const phone = order.customer_phone;
-  const locale = await resolveLocale(phone);
-  const messages = getMessages(locale);
+  const messages = await resolveMessages(phone);
   const customer = await getCustomerByPhone(phone);
   const firstName = customer?.name?.split(' ')[0] || 'Cliente';
 
@@ -777,37 +821,107 @@ async function finalizeMultiItemOrder(orderNumber: string, items: OrderItemEntry
     await sendReply(phone, messages.agent.basketDeclinedNotice(declined.map((i) => i.productName)));
   }
 
-  await sendReply(phone, messages.agent.stockConfirmedIntro(available.map((i) => i.productName).join(', '), firstName));
-
-  const proformaLineItems: { description: string; reference: string; price: number; supplierNote?: string | null; isService?: boolean }[] = [];
+  // Committed to this order the moment admin confirms — see the same
+  // reasoning in confirmStockAndFinalizeOrder.
   for (const item of available) {
     await decrementOfferStock(item.productId, item.quantity || 1);
-    const itemUnitPrice = Number(item.unitPrice ?? (item as any).price ?? (item as any).unit_price ?? 0);
-    proformaLineItems.push({
-      description: item.productName,
-      reference: item.reference || '—',
-      price: isNaN(itemUnitPrice) ? 0 : itemUnitPrice,
-      supplierNote: messages.pdf.proforma.supplierLabel(item.supplierName || 'Rede Peças'),
-    });
-    if (item.serviceName) {
-      const itemSvcPrice = Number(item.servicePrice ?? (item as any).service_price ?? 0);
-      proformaLineItems.push({
-        description: item.serviceName,
-        reference: '—',
-        price: isNaN(itemSvcPrice) ? 0 : itemSvcPrice,
-        supplierNote: null,
-        isService: true,
-      });
-    }
   }
 
-  const proformaPath = await generateProformaPDF(orderNumber, phone, proformaLineItems, locale);
-  await sendProformaWhatsApp(phone, proformaPath, orderNumber, locale);
+  const confirmedIntro = messages.agent.stockConfirmedIntro(available.map((i) => i.productName), firstName);
+  // preserve the bold product names so a humanized rewrite keeps the list
+  // instead of folding it back into one comma-joined sentence.
+  await sendReply(phone, confirmedIntro, { preserve: extractBoldTerms(confirmedIntro) });
+  // Address/NIF next; the proforma + payment follow once they're in
+  // (sendProformaAndAskPayment, called from orderProfile.service.ts).
+  await startOrderProfileCapture(phone, orderNumber);
 
+  logger.info(`[ADMIN STOCK][BASKET] Order ${orderNumber} stock settled — ${available.length} available, ${declined.length} declined; collecting customer details`);
+}
+
+type ProformaLineItem = { description: string; reference: string; price: number; supplierNote?: string | null; isService?: boolean };
+
+/**
+ * Builds an order's proforma line items — a multi-item order's 'available'
+ * items (each with its attached service, if any), or a single-product
+ * order's product + optional service.
+ */
+async function buildProformaLineItems(orderNumber: string, locale: 'pt' | 'en'): Promise<ProformaLineItem[]> {
+  const messages = getMessages(locale);
+  const raw = await getOrderRaw(orderNumber);
+  const lines: ProformaLineItem[] = [];
+
+  if (raw?.items) {
+    const available = (raw.items as OrderItemEntry[]).filter((i) => i.availabilityStatus === 'available');
+    for (const item of available) {
+      const itemUnitPrice = Number(item.unitPrice ?? (item as any).price ?? (item as any).unit_price ?? 0);
+      lines.push({
+        description: item.productName,
+        reference: item.reference || '—',
+        price: isNaN(itemUnitPrice) ? 0 : itemUnitPrice,
+        supplierNote: messages.pdf.proforma.supplierLabel(item.supplierName || 'Rede Peças'),
+      });
+      if (item.serviceName) {
+        const itemSvcPrice = Number(item.servicePrice ?? (item as any).service_price ?? 0);
+        lines.push({
+          description: item.serviceName,
+          reference: '—',
+          price: isNaN(itemSvcPrice) ? 0 : itemSvcPrice,
+          supplierNote: null,
+          isService: true,
+        });
+      }
+    }
+    return lines;
+  }
+
+  const order = await getOrderByNumber(orderNumber);
+  if (!order) throw new ApiError(404, `Order ${orderNumber} not found`);
+  const rawProdPrice = Number(order.unit_price ?? (order as any).price ?? 0);
+  lines.push({
+    description: order.product_name,
+    reference: order.reference || '—',
+    price: isNaN(rawProdPrice) ? 0 : rawProdPrice,
+    supplierNote: messages.pdf.proforma.supplierLabel(order.supplier_name || 'Rede Peças'),
+  });
+  if (order.service_price) {
+    const rawSvcPrice = Number(order.service_price);
+    lines.push({ description: order.service_name, reference: '—', price: isNaN(rawSvcPrice) ? 0 : rawSvcPrice, supplierNote: null, isService: true });
+  }
+  return lines;
+}
+
+/**
+ * The last step before payment, once stock is confirmed and the customer's
+ * address/NIF are in: sends a last-look order summary (items, total,
+ * customer type/NIF, delivery address), then the proforma PDF for the order
+ * (single-product or multi-item), then asks for the payment method.
+ */
+export async function sendProformaAndAskPayment(phone: string, orderNumber: string): Promise<void> {
+  const locale = await resolveLocale(phone);
+  const messages = getMessages(locale);
+  const lineItems = await buildProformaLineItems(orderNumber, locale);
   const total = await getOrderAmount(orderNumber);
-  await askPaymentMethod(phone, orderNumber, total);
 
-  logger.info(`[ADMIN STOCK][BASKET] Order ${orderNumber} finalized — ${available.length} available, ${declined.length} declined`);
+  // finalizeOrderProfile saves type/NIF/address to the customer before
+  // calling here, so the profile read back is this order's details.
+  const customer = await getCustomerByPhone(phone);
+  // Raw send, not sendReply: the humanize rewrite must never reword or drop
+  // a line of a summary the customer is meant to check.
+  await sendWhatsAppMessage(
+    phone,
+    messages.orderProfile.orderReviewSummary(
+      orderNumber,
+      lineItems.map((l) => ({ description: l.description, reference: l.reference, price: formatPrice(l.price) })),
+      formatPrice(total),
+      customer?.customer_type === 'company' ? 'company' : 'individual',
+      customer?.nif ?? null,
+      customer?.address ?? '—'
+    )
+  );
+
+  const proformaPath = await generateProformaPDF(orderNumber, phone, lineItems, locale);
+  await sendProformaWhatsApp(phone, proformaPath, orderNumber, locale);
+  await askPaymentMethod(phone, orderNumber, total);
 }
 
 /**
@@ -820,6 +934,41 @@ function buildAlternativeListRows(options: Product[], skipLabel: string): { id: 
   const rows = buildProductListRows(options);
   rows.push({ id: `option_${options.length + 1}`, title: truncate(skipLabel, 24), description: '' });
   return rows;
+}
+
+/**
+ * Finds in-stock alternatives for a product admin marked unavailable. Re-runs
+ * the customer's own search phrase first (same all-words search they got
+ * originally, minus every excluded product), so the options match what they
+ * asked for. Falls back to an any-word match on the rejected product's name
+ * within its own subcategory — otherwise one common word in its name could
+ * surface a completely unrelated part — when there's no saved phrase (orders
+ * placed before it was stored, restock re-orders) or it finds nothing.
+ */
+async function searchAlternativeProducts(
+  phone: string,
+  opts: { searchQuery: string | null; rejectedProductId: number; rejectedProductName: string; excludeProductIds: number[]; partType: string | null }
+): Promise<Product[]> {
+  const vehicle = await resolveSearchVehicle(phone);
+
+  if (opts.searchQuery) {
+    const byQuery = await searchProductsInInventory({
+      part: opts.searchQuery,
+      vehicle,
+      excludeProductIds: opts.excludeProductIds,
+      productType: opts.partType,
+    });
+    if (byQuery.length) return byQuery;
+  }
+
+  const rejectedProduct = await getProductByIdAnyStatus(opts.rejectedProductId);
+  return searchProductsInInventory({
+    part: opts.rejectedProductName,
+    vehicle,
+    excludeProductIds: opts.excludeProductIds,
+    subcategory: rejectedProduct?.subcategory,
+    matchMode: 'any',
+  });
 }
 
 /**
@@ -845,18 +994,12 @@ async function searchAlternativesForNextItem(orderNumber: string, phone: string)
   }
 
   const messages = await resolveMessages(phone);
-  const vehicle = await resolveSearchVehicle(phone);
-  const excludeProductIds = [item.productId, ...(item.excludedProductIds || [])];
-  // Constrain to the rejected product's own subcategory (e.g. 'Brakes') —
-  // otherwise the OR-joined full-text query can match on just one common
-  // word in its name and surface a completely unrelated part as an
-  // "alternative". See searchProductsInInventory's subcategory param.
-  const rejectedProduct = await getProductByIdAnyStatus(item.productId);
-  const options = await searchProductsInInventory({
-    part: item.productName,
-    vehicle,
-    excludeProductIds,
-    subcategory: rejectedProduct?.subcategory,
+  const options = await searchAlternativeProducts(phone, {
+    searchQuery: item.searchQuery ?? null,
+    rejectedProductId: item.productId,
+    rejectedProductName: item.productName,
+    excludeProductIds: [item.productId, ...(item.excludedProductIds || [])],
+    partType: order?.part_type ?? null,
   });
 
   if (!options.length) {
@@ -870,7 +1013,9 @@ async function searchAlternativesForNextItem(orderNumber: string, phone: string)
   await savePendingAlternativeOffer(phone, { orderNumber, itemId });
   await sendReplyList(
     phone,
-    messages.agent.alternativesListBody(item.productName, options.length),
+    // Name the part the way the customer asked for it, not the rejected
+    // product's catalog name.
+    messages.agent.alternativesListBody(item.searchQuery || item.productName, options.length),
     messages.agent.searchListButton(),
     buildAlternativeListRows(options, messages.agent.alternativeSkipOption())
   );
@@ -912,12 +1057,17 @@ export async function processAlternativeSelection(
   const idx = resolveOptionIndex(customerText, listReplyId);
   if (idx === null) return false;
 
+  if (offer.itemId === undefined) {
+    return processSingleOrderAlternativeSelection(phone, idx, pendingOptions, offer.orderNumber);
+  }
+  const itemId = offer.itemId;
+
   const messages = await resolveMessages(phone);
 
   if (idx === pendingOptions.length) {
     await clearPendingOptions(phone);
     await clearPendingAlternativeOffer(phone);
-    await declineOrderItem(offer.orderNumber, offer.itemId);
+    await declineOrderItem(offer.orderNumber, itemId);
     await advanceAlternativeResolution(offer.orderNumber, phone);
     return true;
   }
@@ -931,7 +1081,7 @@ export async function processAlternativeSelection(
   await clearPendingOptions(phone);
   await clearPendingAlternativeOffer(phone);
 
-  await replaceOrderItemWithAlternative(offer.orderNumber, offer.itemId, {
+  await replaceOrderItemWithAlternative(offer.orderNumber, itemId, {
     id: choice.id!,
     name: choice.name,
     reference: choice.reference,
@@ -942,7 +1092,7 @@ export async function processAlternativeSelection(
 
   const order = await getOrderRaw(offer.orderNumber);
   const items: OrderItemEntry[] = order?.items || [];
-  const item = items.find((i) => i.itemId === offer.itemId);
+  const item = items.find((i) => i.itemId === itemId);
   if (item) {
     // The swapped-in alternative is 'pending' again and needs its own admin
     // confirmation — move the order back to 'awaiting_stock_confirmation' so
@@ -960,9 +1110,46 @@ export async function processAlternativeSelection(
 }
 
 /**
- * Finalizes an order once staff confirm stock is available: sends the
- * customer a confirmation message, generates and sends the proforma PDF, and
- * kicks off the payment-method flow.
+ * Handles the customer's pick from a single-product order's alternatives
+ * list (sent by processStockUnavailableChoice): swaps the product on the
+ * same order — never a new order — and sends it back to admin for its own
+ * stock confirmation, exactly like the original product went through.
+ */
+async function processSingleOrderAlternativeSelection(
+  phone: string,
+  idx: number,
+  pendingOptions: Product[],
+  orderNumber: string
+): Promise<boolean> {
+  const choice = pendingOptions[idx];
+  if (!choice) {
+    const messages = await resolveMessages(phone);
+    await sendReply(phone, messages.agent.optionNotFound());
+    return true;
+  }
+
+  await clearPendingOptions(phone);
+  await clearPendingAlternativeOffer(phone);
+
+  await replaceOrderProductWithAlternative(orderNumber, {
+    id: choice.id!,
+    name: choice.name,
+    reference: choice.reference,
+    price: choice.price,
+    supplier_id: choice.supplier_id!,
+    supplier: choice.supplier,
+  });
+  logger.info(`[ALTERNATIVE] ${phone} swapped order ${orderNumber} to alternative "${choice.name}" — back to stock confirmation`);
+
+  await requestStockConfirmation(phone, orderNumber);
+  return true;
+}
+
+/**
+ * Handles staff confirming a single-product order's stock: reserves the
+ * unit, tells the customer it's available, and moves on to collecting their
+ * address/NIF — the proforma and payment follow once those are in
+ * (sendProformaAndAskPayment).
  */
 export async function confirmStockAndFinalizeOrder(orderNumber: string): Promise<void> {
   const order = await getOrderByNumber(orderNumber);
@@ -975,33 +1162,11 @@ export async function confirmStockAndFinalizeOrder(orderNumber: string): Promise
   await decrementOfferStock(order.product_id, order.quantity || 1);
 
   const phone = order.customer_phone;
-  const rawProdPrice = Number(order.unit_price ?? (order as any).price ?? 0);
-  const product: Product = {
-    name: order.product_name,
-    reference: order.reference || '—',
-    price: isNaN(rawProdPrice) ? 0 : rawProdPrice,
-    quantity: order.quantity || 1,
-    supplier: order.supplier_name,
-  };
-  const rawSvcPrice = order.service_price ? Number(order.service_price) : 0;
-  const service = order.service_price
-    ? { name: order.service_name, price: isNaN(rawSvcPrice) ? 0 : rawSvcPrice }
-    : null;
-  const total = product.price + (service?.price ?? 0);
-
   const customer = await getCustomerByPhone(phone);
   const firstName = customer?.name?.split(' ')[0] || 'Cliente';
-  const locale = await resolveLocale(phone);
-  const messages = getMessages(locale);
-  await sendReply(phone, messages.agent.stockConfirmedIntro(product.name, firstName));
-
-  const proformaLineItems = [
-    { description: product.name, reference: product.reference, price: product.price, supplierNote: messages.pdf.proforma.supplierLabel(product.supplier || 'Rede Peças') },
-    ...(service ? [{ description: service.name, reference: '—', price: service.price, supplierNote: null, isService: true }] : []),
-  ];
-  const proformaPath = await generateProformaPDF(orderNumber, phone, proformaLineItems, locale);
-  await sendProformaWhatsApp(phone, proformaPath, orderNumber, locale);
-  await askPaymentMethod(phone, orderNumber, total);
+  const messages = await resolveMessages(phone);
+  await sendReply(phone, messages.agent.stockConfirmedIntro([order.product_name], firstName));
+  await startOrderProfileCapture(phone, orderNumber);
 }
 
 /**
@@ -1069,15 +1234,14 @@ export async function processStockUnavailableChoice(
 
   if (isYes) {
     await clearPendingStockUnavailableOffer(phone);
-    const vehicle = await resolveSearchVehicle(phone);
-    // Constrain to the rejected product's own subcategory — see the same
-    // reasoning in searchAlternativesForNextItem (multi-item basket flow).
-    const rejectedProduct = await getProductByIdAnyStatus(offer.productId);
-    const options = await searchProductsInInventory({
-      part: offer.productName,
-      vehicle,
+    const order = await getOrderRaw(offer.orderNumber);
+    const searchQuery: string | null = order?.search_query ?? null;
+    const options = await searchAlternativeProducts(phone, {
+      searchQuery,
+      rejectedProductId: offer.productId,
+      rejectedProductName: offer.productName,
       excludeProductIds: [offer.productId],
-      subcategory: rejectedProduct?.subcategory,
+      partType: order?.part_type ?? null,
     });
     if (!options.length) {
       await sendReplyButtons(phone, messages.agent.noStockFound(), messages.agent.noStockFoundButtons);
@@ -1085,9 +1249,15 @@ export async function processStockUnavailableChoice(
       return true;
     }
     await savePendingOptions(phone, options);
+    // Ties the list to the existing order, so the pick swaps its product
+    // (processAlternativeSelection) instead of being treated as a stale tap
+    // or turned into a brand-new order.
+    await savePendingAlternativeOffer(phone, { orderNumber: offer.orderNumber });
     await sendReplyList(
       phone,
-      messages.agent.searchListBody(options.length, offer.productName, customerName),
+      // Name the part the way the customer asked for it, not the rejected
+      // product's catalog name.
+      messages.agent.searchListBody(options.length, searchQuery || offer.productName, customerName),
       messages.agent.searchListButton(),
       buildProductListRows(options)
     );
@@ -1139,11 +1309,11 @@ export async function processAdminStockReply(adminPhone: string, buttonReplyId: 
 }
 
 /**
- * Sweeps orders overdue by 20+ minutes awaiting stock confirmation and
+ * Sweeps orders overdue by 10+ minutes awaiting stock confirmation and
  * sends each customer a courtesy "still checking" message.
  */
 export async function sendStockConfirmationCourtesyMessages(): Promise<void> {
-  const overdue = await getOrdersAwaitingCourtesyMessage(20);
+  const overdue = await getOrdersAwaitingCourtesyMessage(10);
   for (const order of overdue) {
     try {
       const messages = await resolveMessages(order.customer_phone);
@@ -1156,13 +1326,13 @@ export async function sendStockConfirmationCourtesyMessages(): Promise<void> {
 }
 
 /**
- * Sweeps orders overdue by 15+ minutes awaiting stock confirmation and
+ * Sweeps orders overdue by 5+ minutes awaiting stock confirmation and
  * re-pushes the Confirm/Unavailable buttons to all admins as a reminder.
  */
 export async function sendStockConfirmationAdminReminders(): Promise<void> {
-  const overdue = await getOrdersAwaitingAdminReminder(15);
+  const overdue = await getOrdersAwaitingAdminReminder(5);
   if (overdue.length) {
-    logger.debug(`[ADMIN STOCK] Admin reminder sweep: ${overdue.length} order(s) overdue past 15 minutes`);
+    logger.debug(`[ADMIN STOCK] Admin reminder sweep: ${overdue.length} order(s) overdue past 5 minutes`);
   }
   for (const order of overdue) {
     try {
@@ -1176,7 +1346,7 @@ export async function sendStockConfirmationAdminReminders(): Promise<void> {
         );
       }
       await markAdminReminderSent(order.number);
-      logger.info(`[ADMIN STOCK] Sent 15-min reminder for order ${order.number} to ${admins.length} admin(s)`);
+      logger.info(`[ADMIN STOCK] Sent 5-min reminder for order ${order.number} to ${admins.length} admin(s)`);
     } catch (error: any) {
       logger.error(`[ADMIN STOCK] Error sending stock-confirmation admin reminder for order ${order.number}`, error);
     }
@@ -1210,7 +1380,7 @@ async function startOrderForProduct(phone: string, product: Product, partType: s
     return;
   }
 
-  await startOrderProfileCapture(phone, orderNumber);
+  await requestStockConfirmation(phone, orderNumber);
 }
 
 /**
@@ -1238,14 +1408,17 @@ export async function processServiceSelection(
 
     if (selection === 'skip') {
       await sendReply(phone, messages.agent.serviceDeclined());
-      await savePendingBasket(phone, { ...basket, items: [...basket.items, { product: offer.product, service: null }] });
+      await savePendingBasket(phone, { ...basket, items: [...basket.items, { product: offer.product, service: null, query: basket.currentQuery }] });
     } else {
       const chosen = offer.services[selection];
       const total = Number(offer.product.price) + Number(chosen.service_base_price);
       await sendReply(phone, messages.agent.serviceAdded(chosen.service_name, formatPrice(total)));
       await savePendingBasket(phone, {
         ...basket,
-        items: [...basket.items, { product: offer.product, service: { name: chosen.service_name, price: Number(chosen.service_base_price) } }],
+        items: [
+          ...basket.items,
+          { product: offer.product, service: { name: chosen.service_name, price: Number(chosen.service_base_price) }, query: basket.currentQuery },
+        ],
       });
     }
     await advanceBasket(phone);
@@ -1254,7 +1427,7 @@ export async function processServiceSelection(
 
   if (selection === 'skip') {
     await sendReply(phone, messages.agent.serviceDeclined());
-    await startOrderProfileCapture(phone, offer.orderNumber);
+    await requestStockConfirmation(phone, offer.orderNumber);
     return true;
   }
 
@@ -1262,11 +1435,76 @@ export async function processServiceSelection(
   await addServiceToOrder(offer.orderNumber, chosen.service_name, chosen.service_base_price);
   const total = Number(offer.product.price) + Number(chosen.service_base_price);
   await sendReply(phone, messages.agent.serviceAdded(chosen.service_name, formatPrice(total)));
-  await startOrderProfileCapture(phone, offer.orderNumber);
+  await requestStockConfirmation(phone, offer.orderNumber);
   return true;
 }
 
 const WAITLIST_YES_EXTRA = /\b(add\s*me|notify\s*me|wait\s*list|waitlist|join\s*(the\s*)?waitlist|avisa[- ]?me|lista\s*de\s*espera)\b/i;
+
+const SUPPLIER_INQUIRY_YES_EXTRA = /\b(verificar|check|verifica)\b/i;
+
+/**
+ * Handles the reply to the zero-results "should our team check with
+ * suppliers?" offer: on yes, asks for a part photo or reference (the next
+ * message is caught by submitSupplierInquiry); on no, acknowledges. Anything
+ * else falls through (returns false) like the other yes/no offers — it's
+ * more likely a new request than a misunderstood answer.
+ */
+export async function processSupplierInquiryOffer(phone: string, reply: string, offer: SupplierInquiry): Promise<boolean> {
+  const messages = await resolveMessages(phone);
+
+  if (isAffirmativeReply(reply, SUPPLIER_INQUIRY_YES_EXTRA)) {
+    await clearPendingSupplierInquiryOffer(phone);
+    await saveAwaitingSupplierInquiryDetails(phone, offer);
+    const askDetails = messages.agent.supplierInquiryAskDetails();
+    await sendReply(phone, askDetails, { preserve: extractBoldTerms(askDetails) });
+    return true;
+  }
+  if (isNegativeReply(reply)) {
+    await clearPendingSupplierInquiryOffer(phone);
+    await sendReply(phone, messages.agent.waitlistDeclined());
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Forwards a supplier inquiry — the part photo (re-sent by its WhatsApp
+ * media id) or typed reference/description, plus who's asking, their vehicle
+ * and what they originally searched — to every admin over WhatsApp, logs it
+ * to admin_alerts, and tells the customer the team will contact them. The
+ * team follows up with the customer directly; there's no bot-side reply flow.
+ */
+export async function submitSupplierInquiry(
+  phone: string,
+  customerName: string,
+  inquiry: SupplierInquiry,
+  details: { text: string | null; imageMediaId: string | null }
+): Promise<void> {
+  await clearAwaitingSupplierInquiryDetails(phone);
+
+  const vehicle = await resolveSearchVehicle(phone);
+  const vehicleSummary = vehicle ? `${vehicle.make} ${vehicle.model} ${vehicle.year}` : '—';
+  const detailsText = details.text?.trim() || (details.imageMediaId ? '📷 (photo attached)' : '—');
+  const body = t.admin.supplierInquiry(customerName, phone, vehicleSummary, inquiry.query, detailsText);
+
+  for (const admin of await getAllAdmins()) {
+    try {
+      if (details.imageMediaId) {
+        await sendWhatsAppImage(admin.phone, details.imageMediaId, body);
+      } else {
+        await sendWhatsAppMessage(admin.phone, body);
+      }
+    } catch (error: any) {
+      logger.error(`Error notifying admin ${admin.phone} about supplier inquiry from ${phone}: ${error.message}`);
+    }
+  }
+  await createAlert('supplier_inquiry', null, body);
+  logger.info(`[SUPPLIER INQUIRY] ${phone} asked the team to check "${inquiry.query}" (${details.imageMediaId ? 'photo' : 'text'})`);
+
+  const messages = await resolveMessages(phone);
+  await sendReply(phone, messages.agent.supplierInquiryReceived());
+}
 
 /**
  * Handles the customer's reply to a "join the waitlist?" offer for an
