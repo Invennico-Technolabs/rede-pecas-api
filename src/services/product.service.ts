@@ -128,7 +128,7 @@ export async function searchAndRespond(phone: string, customerText: string, cust
   if (!options || options.length === 0) {
     logger.info(`[PRODUCT SEARCH] ${phone} no matches for "${customerText}"`);
 
-    const candidate = await findZeroQuantityProductMatch({ part: customerText, productType: partType || null });
+    const candidate = await findZeroQuantityProductMatch({ part: customerText, vehicle, productType: partType || null });
     if (candidate) {
       logger.info(`[PRODUCT SEARCH] ${phone} offering waitlist for out-of-stock match: ${candidate.name}`);
       await sendReplyButtons(phone, messages.agent.noStockFound(), messages.agent.noStockFoundButtons);
@@ -299,7 +299,7 @@ async function searchNextBasketItem(phone: string, customerName: string): Promis
   if (!options || options.length === 0) {
     logger.info(`[PRODUCT SEARCH][BASKET] ${phone} no matches for "${part}"`);
 
-    const candidate = await findZeroQuantityProductMatch({ part, productType: basket.partType || null });
+    const candidate = await findZeroQuantityProductMatch({ part, vehicle, productType: basket.partType || null });
     await savePendingBasket(phone, {
       ...basket,
       queue: rest,

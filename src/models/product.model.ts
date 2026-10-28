@@ -66,6 +66,18 @@ export type SearchMatchMode = 'all' | 'any';
 
 const SEARCH_CANDIDATE_LIMIT = 50;
 
+// Aggregates every compatible-vehicle fit of product `p` into `vf.fits`, for
+// the in-app anyFitMatches check — shared by the in-stock and out-of-stock
+// (waitlist) searches so both apply the same vehicle compatibility rule.
+const VEHICLE_FITS_LATERAL = `
+    LEFT JOIN LATERAL (
+      SELECT json_agg(json_build_object(
+        'make', pv.vehicle_make, 'model', pv.vehicle_model,
+        'year_start', pv.year_start, 'year_end', pv.year_end
+      )) AS fits
+      FROM product_vehicles pv WHERE pv.product_id = p.id
+    ) vf ON true`;
+
 /**
  * Checks whether a product's vehicle-restriction field (make/model, slash-
  * separated for multiple options) is compatible with the customer's vehicle value, treating a missing product
@@ -177,13 +189,7 @@ export async function searchProductsInInventory({
     FROM products p
     JOIN product_suppliers ps ON ps.product_id = p.id
     JOIN suppliers s ON s.id = ps.supplier_id
-    LEFT JOIN LATERAL (
-      SELECT json_agg(json_build_object(
-        'make', pv.vehicle_make, 'model', pv.vehicle_model,
-        'year_start', pv.year_start, 'year_end', pv.year_end
-      )) AS fits
-      FROM product_vehicles pv WHERE pv.product_id = p.id
-    ) vf ON true
+    ${VEHICLE_FITS_LATERAL}
     WHERE
       ps.quantity > 0
       AND ps.active = true
@@ -428,29 +434,39 @@ export async function hardDeleteProduct(id: number): Promise<HardDeleteResult> {
  * Full-text searches for an active, out-of-stock (quantity = 0) offer
  * matching every word of `part`, used to check whether a "no stock" search
  * should offer a restock waitlist instead of nothing. Always all-words
- * matching — only the customer's own search phrase reaches this.
+ * matching — only the customer's own search phrase reaches this. Filtered
+ * by the customer's vehicle the same way as searchProductsInInventory, so a
+ * customer is never waitlisted for a part that wouldn't fit their car.
  */
 export async function findZeroQuantityProductMatch({
   part,
+  vehicle,
   productType,
 }: {
   part: string;
+  vehicle?: SearchVehicle | null;
   // Same soft filter as searchProductsInInventory — a NULL product_type row
   // (pre-existing catalog data) still matches regardless of the customer's choice.
   productType?: string | null;
 }): Promise<{ id: number; name: string } | null> {
   const { rows } = await db.query(
-    `SELECT ps.id, p.name
+    `SELECT ps.id, p.name, vf.fits AS vehicle_fits
      FROM product_suppliers ps
      JOIN products p ON p.id = ps.product_id
+     ${VEHICLE_FITS_LATERAL}
      WHERE ps.quantity = 0
        AND ps.active = true
        AND p.active = true
        AND p.search_vector @@ ${AND_TSQUERY}
        AND ($2::text IS NULL OR p.product_type IS NULL OR p.product_type = $2)
      ORDER BY ps.updated_at DESC
-     LIMIT 1`,
+     LIMIT ${SEARCH_CANDIDATE_LIMIT}`,
     [part, productType ?? null]
   );
-  return rows.length ? rows[0] : null;
+
+  const match = vehicle
+    ? rows.find((p: any) => anyFitMatches(p.vehicle_fits, vehicle))
+    : rows[0];
+  logger.debug(`[PRODUCT SEARCH] out-of-stock query="${part}" vehicle=${vehicle ? `${vehicle.make} ${vehicle.model} ${vehicle.year}` : 'none'} candidates=${rows.length} match=${match ? match.name : 'none'}`);
+  return match ? { id: match.id, name: match.name } : null;
 }
